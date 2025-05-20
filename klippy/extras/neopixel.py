@@ -8,7 +8,7 @@ from . import led
 
 BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
 
-BIT_MAX_TIME=.000004
+BIT_MAX_TIME=.000030
 RESET_MIN_TIME=.000050
 
 MAX_MCU_SIZE = 500  # Sanity check on LED chain length
