@@ -137,6 +137,7 @@ class ServerSocket:
             'klippy:disconnect', self._handle_disconnect)
         printer.register_event_handler(
             "klippy:shutdown", self._handle_shutdown)
+        os.chmod(server_address,0o777)
 
     def _handle_accept(self, eventtime):
         try:
