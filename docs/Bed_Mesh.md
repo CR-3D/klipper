@@ -267,7 +267,7 @@ by heat or interference.  This can make calculating the probe's z-offset
 challenging, particularly at different bed temperatures.  As such, some
 printers use an endstop for homing the Z axis and a probe for calibrating the
 mesh. In this configuration it is possible offset the mesh so that the (X, Y)
-`reference position` applies zero adjustment.  The `reference postion` should
+`reference position` applies zero adjustment.  The `reference position` should
 be the location on the bed where a
 [Z_ENDSTOP_CALIBRATE](./Manual_Level.md#calibrating-a-z-endstop)
 paper test is performed.  The bed_mesh module provides the
@@ -497,7 +497,8 @@ _Default Adaptive Margin: 0_
 
 Initiates the probing procedure for Bed Mesh Calibration.
 
-The mesh will be saved into a profile specified by the `PROFILE` parameter,
+The mesh will be immediately ready to use when the command completes and saved
+into a profile specified by the `PROFILE` parameter,
 or `default` if unspecified. The `METHOD` parameter takes one of the following
 values:
 
@@ -560,6 +561,10 @@ allowing the user to determine when a profile is loaded.  If a user wishes to
 load the `default` profile it is recommended to add
 `BED_MESH_PROFILE LOAD=default` to either their `START_PRINT` macro or their
 slicer's "Start G-Code" configuration, whichever is applicable.
+
+Note that this is not required if a new mesh is generated with
+`BED_MESH_CALIBRATE` in the `START_PRINT` macro or the slicer's "Start G-Code"
+and may produce unexpected results, especially with adaptive meshing.
 
 Alternatively the old behavior of loading a profile at startup can be
 restored with a `[delayed_gcode]`:
