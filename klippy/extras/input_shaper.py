@@ -114,15 +114,15 @@ class InputShaper:
     def connect(self):
         self.toolhead = self.printer.lookup_object("toolhead")
         dual_carriage = self.printer.lookup_object('dual_carriage', None)
-        if dual_carriage is not None:
-            for shaper in self.shapers:
-                if shaper.is_enabled():
-                    raise self.printer.config_error(
-                            'Input shaper parameters cannot be configured via'
-                            ' [input_shaper] section with dual_carriage(s) '
-                            ' enabled. Refer to Klipper documentation on how '
-                            ' to configure input shaper for dual_carriage(s).')
-            return
+        #if dual_carriage is not None:
+        #    for shaper in self.shapers:
+        #        if shaper.is_enabled():
+        #            raise self.printer.config_error(
+        #                    'Input shaper parameters cannot be configured via'
+        #                    ' [input_shaper] section with dual_carriage(s) '
+        #                    ' enabled. Refer to Klipper documentation on how '
+        #                    ' to configure input shaper for dual_carriage(s).')
+        #    return
         # Configure initial values
         self._update_input_shaping(error=self.printer.config_error)
     def _get_input_shaper_stepper_kinematics(self, stepper):
