@@ -132,7 +132,7 @@ class TemperatureProbe:
         self.start_pos = []
 
         # Register GCode Commands
-        pname = self.name.split(maxsplit=1)[-1]
+        pname = self.name.split(None, 1)[-1]
         self.gcode.register_mux_command(
             "TEMPERATURE_PROBE_CALIBRATE", "PROBE", pname,
             self.cmd_TEMPERATURE_PROBE_CALIBRATE,
@@ -185,7 +185,7 @@ class TemperatureProbe:
     def get_temp(self, eventtime=None):
         return self.last_measurement[0], self.target_temp
 
-    def _collect_sample(self, kin_pos, tool_zero_z):
+    def _collect_sample(self, mpresult, tool_zero_z):
         probe = self._get_probe()
         x_offset, y_offset, _ = probe.get_offsets()
         speeds = self._get_speeds()
@@ -198,7 +198,7 @@ class TemperatureProbe:
         cur_pos[0] -= x_offset
         cur_pos[1] -= y_offset
         toolhead.manual_move(cur_pos, move_speed)
-        return self.cal_helper.collect_sample(kin_pos, tool_zero_z, speeds)
+        return self.cal_helper.collect_sample(mpresult, tool_zero_z, speeds)
 
     def _prepare_next_sample(self, last_temp, tool_zero_z):
         # Register our own abort command now that the manual
@@ -221,23 +221,23 @@ class TemperatureProbe:
             % (self.name, cnt, exp_cnt, last_temp, self.next_auto_temp)
         )
 
-    def _manual_probe_finalize(self, kin_pos):
-        if kin_pos is None:
+    def _manual_probe_finalize(self, mpresult):
+        if mpresult is None:
             # Calibration aborted
             self._finalize_drift_cal(False)
             return
         if self.last_zero_pos is not None:
-            z_diff = self.last_zero_pos[2] - kin_pos[2]
+            z_diff = self.last_zero_pos - mpresult.bed_z
             self.total_expansion += z_diff
             logging.info(
                 "Estimated Total Thermal Expansion: %.6f"
                 % (self.total_expansion,)
             )
-        self.last_zero_pos = kin_pos
+        self.last_zero_pos = mpresult.bed_z
         toolhead = self.printer.lookup_object("toolhead")
         tool_zero_z = toolhead.get_position()[2]
         try:
-            last_temp = self._collect_sample(kin_pos, tool_zero_z)
+            last_temp = self._collect_sample(mpresult, tool_zero_z)
         except Exception:
             self._finalize_drift_cal(False)
             raise
@@ -357,8 +357,8 @@ class TemperatureProbe:
         self._check_homed()
         probe = self._get_probe()
         probe_name = probe.get_status(None)["name"]
-        short_name = probe_name.split(maxsplit=1)[-1]
-        if short_name != self.name.split(maxsplit=1)[-1]:
+        short_name = probe_name.split(None, 1)[-1]
+        if short_name != self.name.split(None, 1)[-1]:
             raise self.gcode.error(
                 "[%s] not linked to registered probe [%s]."
                 % (self.name, probe_name)
@@ -562,7 +562,7 @@ class EddyDriftCompensation:
             % (self.name, self.cal_temp)
         )
 
-    def collect_sample(self, kin_pos, tool_zero_z, speeds):
+    def collect_sample(self, mpresult, tool_zero_z, speeds):
         if self.calibration_samples is None:
             self.calibration_samples = [[] for _ in range(DRIFT_SAMPLE_COUNT)]
         move_times = []
@@ -588,7 +588,7 @@ class EddyDriftCompensation:
                     temps[idx] = cur_temp
                     probe_samples[idx].append(sample)
             return True
-        sect_name = "probe_eddy_current " + self.name.split(maxsplit=1)[-1]
+        sect_name = "probe_eddy_current " + self.name.split(None, 1)[-1]
         self.printer.lookup_object(sect_name).add_client(_on_bulk_data_recd)
         for i in range(DRIFT_SAMPLE_COUNT):
             if i == 0:
@@ -616,7 +616,7 @@ class EddyDriftCompensation:
             zvals = [d[2] for d in data]
             avg_freq = sum(freqs) / len(freqs)
             avg_z = sum(zvals) / len(zvals)
-            kin_z = i * .5 + .05 + kin_pos[2]
+            kin_z = i * .5 + .05 + mpresult.bed_z
             logging.info(
                 "Probe Values at Temp %.2fC, Z %.4fmm: Avg Freq = %.6f, "
                 "Avg Measured Z = %.6f"
