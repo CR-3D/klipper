@@ -2,7 +2,7 @@
 #
 # This module has been adapted from code written by Kevin O'Connor <kevin@koconnor.net> and Martin Hierholzer <martin@hierholzer.info> as well as Viesturs Zariņš <viesturz@gmail.com>
 # Sourced from https://github.com/ben5459/Klipper_ToolChanger/blob/master/probe_multi_axis.py and https://github.com/viesturz/klipper-toolchanger/blob/main/klipper/extras/tools_calibrate.py
-# Version: ee7fdc4 2024-12-21
+# Version: 6a683d0 2025-06-25
 
 import logging
 
@@ -344,7 +344,7 @@ class ProbeEndstopWrapper:
     def __init__(self, config, axis):
         self.printer = config.get_printer()
         self.axis = axis
-        self.idex = config.has_section('dual_carriage')
+        self.idex = config.has_section('dual_carriage') or config.has_section('dual_carriage u')
         # Create an "endstop" object to handle the probe pin
         ppins = self.printer.lookup_object('pins')
         pin = config.get('pin')
@@ -365,8 +365,9 @@ class ProbeEndstopWrapper:
     def _get_steppers(self):
         if self.idex and self.axis == 'x':
             dual_carriage = self.printer.lookup_object('dual_carriage')
-            prime_rail = dual_carriage.get_primary_rail()
-            return prime_rail.get_rail().get_steppers()
+            axis = "xyz".index(self.axis)
+            prime_rail = dual_carriage.get_primary_rail(axis)
+            return prime_rail.get_steppers()
         else:
             return self.mcu_endstop.get_steppers()
 
