@@ -55,7 +55,8 @@ enum { POSITION_BIAS=0x40000000 };
 
 enum {
     SF_LAST_DIR=1<<0, SF_NEXT_DIR=1<<1, SF_INVERT_STEP=1<<2, SF_NEED_RESET=1<<3,
-    SF_SINGLE_SCHED=1<<4, SF_OPTIMIZED_PATH=1<<5, SF_HAVE_ADD=1<<6
+    SF_SINGLE_SCHED=1<<4, SF_OPTIMIZED_PATH=1<<5, SF_HAVE_ADD=1<<6,
+    SF_PHYS_DIR=1<<7 // current level of the dir pin (see buffer_feed.c)
 };
 
 // Setup a stepper for the next move in its queue
@@ -114,6 +115,7 @@ stepper_load_next(struct stepper *s)
                 while (timer_is_before(timer_read_time(), min_next_time))
                     ;
             gpio_out_toggle_noirq(s->dir_pin);
+            s->flags ^= SF_PHYS_DIR;
             uint32_t curtime = timer_read_time();
             min_next_time = curtime + s->step_pulse_ticks;
             if (timer_is_before(s->time.waketime, min_next_time))
@@ -123,8 +125,10 @@ stepper_load_next(struct stepper *s)
     }
 
     // Set new direction (if needed)
-    if (need_dir_change)
+    if (need_dir_change) {
         gpio_out_toggle_noirq(s->dir_pin);
+        s->flags ^= SF_PHYS_DIR;
+    }
     return SF_RESCHEDULE;
 }
 
@@ -269,6 +273,7 @@ command_queue_step(uint32_t *args)
 
     irq_disable();
     uint8_t flags = s->flags;
+    uint8_t host_dir = !!(flags & SF_LAST_DIR);
     if (!!(flags & SF_LAST_DIR) != !!(flags & SF_NEXT_DIR)) {
         flags ^= SF_LAST_DIR;
         m->flags |= MF_DIR;
@@ -280,6 +285,11 @@ command_queue_step(uint32_t *args)
         move_free(m);
     } else {
         s->flags = flags;
+        // The dir pin may have been changed by buffer_feed.c while idle
+        if (!!(s->flags & SF_PHYS_DIR) != host_dir) {
+            gpio_out_toggle_noirq(s->dir_pin);
+            s->flags ^= SF_PHYS_DIR;
+        }
         move_queue_push(&m->node, &s->mq);
         stepper_load_next(s);
         sched_add_timer(&s->time);
@@ -378,6 +388,49 @@ command_stepper_stop_on_trigger(uint32_t *args)
 }
 DECL_COMMAND(command_stepper_stop_on_trigger,
              "stepper_stop_on_trigger oid=%c trsync_oid=%c");
+
+// Support for buffer_feed.c - allows an independent step source to add
+// extra steps to a stepper that uses "step on both edges".  Host queued
+// moves and extra steps are merged on the same step pin.  The host's
+// position tracking does not see the extra steps.
+
+// Return the 'struct stepper' for an oid (NULL if it can not be shared)
+struct stepper *
+stepper_lookup_shared(uint8_t oid)
+{
+    struct stepper *s = stepper_oid_lookup(oid);
+    if (!(s->flags & SF_SINGLE_SCHED))
+        return NULL;
+    return s;
+}
+
+// Emit one extra step (one toggle of the step pin).  Irqs must be off.
+void
+stepper_inject_step(struct stepper *s)
+{
+    gpio_out_toggle_noirq(s->step_pin);
+}
+
+// Return the current level of the dir pin.  Irqs must be off.
+uint_fast8_t
+stepper_get_dir_level(struct stepper *s)
+{
+    return !!(s->flags & SF_PHYS_DIR);
+}
+
+// Change the dir pin of an idle stepper (queue_step restores it before the
+// next host move starts).  Irqs must be off.  Returns 0 if not idle.
+uint_fast8_t
+stepper_set_idle_dir(struct stepper *s, uint_fast8_t level)
+{
+    if (s->count || !move_queue_empty(&s->mq))
+        return 0;
+    if (!!level != !!(s->flags & SF_PHYS_DIR)) {
+        gpio_out_toggle_noirq(s->dir_pin);
+        s->flags ^= SF_PHYS_DIR;
+    }
+    return 1;
+}
 
 void
 stepper_shutdown(void)

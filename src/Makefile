@@ -10,6 +10,7 @@ src-$(CONFIG_WANT_HARD_PWM) += pwmcmds.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += sdiocmds.c
 
 src-$(CONFIG_WANT_BUTTONS) += buttons.c
+src-$(CONFIG_WANT_BUFFER_FEED) += buffer_feed.c
 src-$(CONFIG_WANT_TMCUART) += tmcuart.c
 src-$(CONFIG_WANT_NEOPIXEL) += neopixel.c
 src-$(CONFIG_WANT_PULSE_COUNTER) += pulse_counter.c
