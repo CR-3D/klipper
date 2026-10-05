@@ -6,9 +6,15 @@
 //    extra steps on an existing stepper.  A stop sensor (buffer full) ends
 //    the feed - the sensor may be overrun, the stepper decelerates with a
 //    ramp.  An optional gate sensor (filament present) enables the feeding.
+//  * "Retract": if the stop sensor triggers (buffer pushed beyond full, eg
+//    by a long retraction), the stepper moves back until it releases.
 //  * "Loading": an entry sensor starts the stepper, which runs until the exit
 //    sensor triggers (or a timeout expires).  After the exit sensor
 //    triggered the stepper moves a configured distance and stops.
+//  * "Runout": if feeding has no effect and the entry sensor reports no
+//    filament, feeding pauses (no fault) until filament is inserted again.
+//
+// Feeding (and retract) and loading are enabled separately by the host.
 //
 // The extra steps are merged into the step stream of the stepper, so this
 // works in parallel with normal (host queued) moves of the same stepper.
@@ -32,13 +38,17 @@ enum {
     BF_REPORT = 1<<3, BF_NEED_RELEASE = 1<<4, BF_TIMER = 1<<5,
     BF_ABORT = 1<<6, BF_HAVE_GATE = 1<<7, BF_HAVE_LOAD = 1<<8,
     BF_NEED_ENTRY_RELEASE = 1<<9, BF_STOPPING = 1<<10,
-    BF_REVERSE_AFTER = 1<<11,
+    BF_REVERSE_AFTER = 1<<11, BF_LOAD_ON = 1<<12, BF_RUNOUT = 1<<13,
+    BF_RETRACT = 1<<14,
 };
+
+// Bits of the enable mask sent by the host
+enum { BE_FEED = 1<<0, BE_LOAD = 1<<1 };
 
 enum { BS_IDLE=0, BS_RUN=1, BS_FAULT=2 };
 
 enum { BR_NONE=0, BR_DONE=1, BR_STOP=2, BR_ABORT=3, BR_FAULT=4, BR_BUSY=5,
-       BR_TIMEOUT=6, BR_LOADED=7 };
+       BR_TIMEOUT=6, BR_LOADED=7, BR_RUNOUT=8, BR_RETRACT_FAULT=9 };
 
 enum { RK_FEED=0, RK_LOAD=1 };
 
@@ -70,13 +80,14 @@ struct buffer_feed {
     struct bf_sensor trig, stop, gate, entry, exit;
     uint32_t poll_ticks;
     uint16_t flags;
-    uint8_t state, reason, tag, rtag, max_runs, runs, kind, stage, clear_back;
+    uint8_t state, reason, tag, rtag, max_runs, runs, rruns, kind, stage;
+    uint8_t clear_back;
     // Sensor that ends the active feed move
     struct bf_sensor *sel_sensor;
     uint8_t sel_level, sel_samples, sel_cnt;
     // Profiles and load parameters set by the host
     struct bf_profile feed_p, load_p;
-    uint32_t clear_steps, load_timeout;
+    uint32_t clear_steps, load_timeout, retract_steps;
     // Active run
     struct bf_profile r;
     uint32_t remaining, done, interval, nd_max, time_left, total;
@@ -162,7 +173,8 @@ static void
 bf_start_run(struct buffer_feed *b, const struct bf_profile *p
              , uint32_t steps, uint8_t kind, uint8_t sel, uint8_t level)
 {
-    b->flags &= ~(BF_AUTO | BF_ABORT | BF_STOPPING | BF_REVERSE_AFTER);
+    b->flags &= ~(BF_AUTO | BF_ABORT | BF_STOPPING | BF_REVERSE_AFTER
+                  | BF_RETRACT);
     b->sel_sensor = bf_sel_sensor(b, sel);
     b->sel_level = !!level;
     b->sel_samples = sel == SEL_STOP ? b->stop.samples : 2;
@@ -197,9 +209,11 @@ bf_finish(struct buffer_feed *b, uint8_t reason)
     if (!(b->flags & BF_AUTO))
         // A load or manual move starts a new series of feed runs
         b->runs = 0;
-    else if (reason == BR_STOP || reason == BR_ABORT)
+    else if (!(b->flags & BF_RETRACT)
+             && (reason == BR_STOP || reason == BR_ABORT))
         // Do not restart until the trigger sensor has been released
         b->flags |= BF_NEED_RELEASE;
+    b->flags &= ~BF_RETRACT;
     b->time.func = buffer_feed_poll_event;
     b->time.waketime = bf_nextwake(b->time.waketime, b->poll_ticks);
     sched_wake_task(&buffer_feed_wake);
@@ -276,62 +290,108 @@ bf_run_end(struct buffer_feed *b)
     return bf_finish(b, (b->flags & BF_STOPPING) ? BR_STOP : BR_DONE);
 }
 
+// Report a fault from the poll timer and stop polling
+static uint_fast8_t
+bf_poll_fault(struct buffer_feed *b, uint8_t reason)
+{
+    b->state = BS_FAULT;
+    b->reason = reason;
+    b->rtag = 0;
+    b->flags |= BF_REPORT;
+    b->flags &= ~BF_TIMER;
+    sched_wake_task(&buffer_feed_wake);
+    return SF_DONE;
+}
+
 // Timer callback while waiting for a sensor
 static uint_fast8_t
 buffer_feed_poll_event(struct timer *t)
 {
     struct buffer_feed *b = container_of(t, struct buffer_feed, time);
     uint16_t flags = b->flags;
-    if (!(flags & BF_ENABLED) || b->state == BS_FAULT) {
+    if (!(flags & (BF_ENABLED | BF_LOAD_ON)) || b->state == BS_FAULT) {
         b->flags &= ~BF_TIMER;
         return SF_DONE;
     }
-    // Load sequence: entry sensor
+    // Entry sensor: load sequence and end of a runout
     if (flags & BF_HAVE_LOAD) {
         if (!bf_active(&b->entry)) {
             b->entry.cnt = 0;
             b->flags &= ~BF_NEED_ENTRY_RELEASE;
-        } else if (!(flags & BF_NEED_ENTRY_RELEASE) && b->load_p.cruise
-                   && bf_sensor_hit(&b->entry)) {
-            b->flags |= BF_NEED_ENTRY_RELEASE;
-            if (bf_active(&b->exit)) {
-                // Filament is already at the exit sensor - nothing to load
-                b->done = 0;
-                b->kind = RK_LOAD;
-                b->reason = BR_LOADED;
-                b->rtag = 0;
-                b->flags |= BF_REPORT;
-                sched_wake_task(&buffer_feed_wake);
-            } else {
-                bf_start_run(b, &b->load_p, 0xFFFFFFFF, RK_LOAD, SEL_NONE, 0);
-                return SF_RESCHEDULE;
+        } else {
+            if (flags & BF_RUNOUT) {
+                // New filament - feeding may resume
+                b->flags &= ~BF_RUNOUT;
+                b->runs = b->rruns = 0;
+            }
+            if ((flags & BF_LOAD_ON) && !(flags & BF_NEED_ENTRY_RELEASE)
+                && b->load_p.cruise && bf_sensor_hit(&b->entry)) {
+                b->flags |= BF_NEED_ENTRY_RELEASE;
+                if (bf_active(&b->exit)) {
+                    // Filament is already at the exit sensor - nothing to load
+                    b->done = 0;
+                    b->kind = RK_LOAD;
+                    b->reason = BR_LOADED;
+                    b->rtag = 0;
+                    b->flags |= BF_REPORT;
+                    sched_wake_task(&buffer_feed_wake);
+                } else {
+                    bf_start_run(b, &b->load_p, 0xFFFFFFFF, RK_LOAD, SEL_NONE
+                                 , 0);
+                    return SF_RESCHEDULE;
+                }
             }
         }
     }
-    // Feeding: trigger sensor (only while the gate sensor is active)
-    uint8_t gate_ok = !(flags & BF_HAVE_GATE) || bf_active(&b->gate);
-    if (!bf_active(&b->trig)) {
-        b->trig.cnt = 0;
-        b->runs = 0;
-        b->flags &= ~BF_NEED_RELEASE;
-    } else if (!gate_ok) {
-        b->trig.cnt = 0;
-    } else if (!(flags & BF_NEED_RELEASE) && b->feed_p.steps
-               && bf_sensor_hit(&b->trig)) {
-        if (b->max_runs && b->runs >= b->max_runs) {
-            // Trigger still active after all permitted runs
-            b->state = BS_FAULT;
-            b->reason = BR_FAULT;
-            b->rtag = 0;
-            b->flags |= BF_REPORT;
-            b->flags &= ~BF_TIMER;
-            sched_wake_task(&buffer_feed_wake);
-            return SF_DONE;
+    flags = b->flags;
+    if ((flags & BF_ENABLED) && !(flags & BF_RUNOUT)) {
+        // Retract: stop sensor (buffer pushed beyond full)
+        if ((flags & BF_HAVE_STOP) && b->retract_steps) {
+            if (!bf_active(&b->stop)) {
+                b->stop.cnt = 0;
+                b->rruns = 0;
+            } else if (bf_sensor_hit(&b->stop)) {
+                if (b->max_runs && b->rruns >= b->max_runs)
+                    // Still beyond full after all permitted retracts
+                    return bf_poll_fault(b, BR_RETRACT_FAULT);
+                b->rruns++;
+                struct bf_profile p = b->feed_p;
+                p.dir = !p.dir;
+                bf_start_run(b, &p, b->retract_steps, RK_FEED, SEL_STOP, 0);
+                b->flags |= BF_AUTO | BF_RETRACT;
+                return SF_RESCHEDULE;
+            }
         }
-        b->runs++;
-        bf_start_run(b, &b->feed_p, b->feed_p.steps, RK_FEED, SEL_STOP, 1);
-        b->flags |= BF_AUTO;
-        return SF_RESCHEDULE;
+        // Feeding: trigger sensor (only while the gate sensor is active)
+        uint8_t gate_ok = !(flags & BF_HAVE_GATE) || bf_active(&b->gate);
+        if (!bf_active(&b->trig)) {
+            b->trig.cnt = 0;
+            b->runs = 0;
+            b->flags &= ~BF_NEED_RELEASE;
+        } else if (!gate_ok) {
+            b->trig.cnt = 0;
+        } else if (!(flags & BF_NEED_RELEASE) && b->feed_p.steps
+                   && bf_sensor_hit(&b->trig)) {
+            if (b->max_runs && b->runs >= b->max_runs) {
+                // Trigger still active after all permitted runs
+                if ((flags & BF_HAVE_LOAD) && !bf_active(&b->entry)) {
+                    // No filament at the entry sensor - runout, no fault
+                    b->flags |= BF_RUNOUT | BF_REPORT;
+                    b->reason = BR_RUNOUT;
+                    b->rtag = 0;
+                    b->done = 0;
+                    sched_wake_task(&buffer_feed_wake);
+                } else {
+                    return bf_poll_fault(b, BR_FAULT);
+                }
+            } else {
+                b->runs++;
+                bf_start_run(b, &b->feed_p, b->feed_p.steps, RK_FEED, SEL_STOP
+                             , 1);
+                b->flags |= BF_AUTO;
+                return SF_RESCHEDULE;
+            }
+        }
     }
     t->waketime = bf_nextwake(t->waketime, b->poll_ticks);
     return SF_RESCHEDULE;
@@ -459,11 +519,13 @@ command_buffer_feed_set_profile(uint32_t *args)
     bf_profile_set(&p, args[2], args[3], args[4], args[5], args[1], args[6]);
     irq_disable();
     b->feed_p = p;
+    b->retract_steps = args[7];
     irq_enable();
 }
 DECL_COMMAND(command_buffer_feed_set_profile,
              "buffer_feed_set_profile oid=%c steps=%u start_interval=%u"
-             " cruise_interval=%u accel_add=%u decel_add=%u dir=%c");
+             " cruise_interval=%u accel_add=%u decel_add=%u dir=%c"
+             " retract_steps=%u");
 
 void
 command_buffer_feed_set_load_profile(uint32_t *args)
@@ -483,16 +545,32 @@ DECL_COMMAND(command_buffer_feed_set_load_profile,
              " cruise_interval=%u accel_add=%u decel_add=%u dir=%c"
              " clear_steps=%u clear_back=%c timeout_ticks=%u");
 
+// Enable feeding (BE_FEED) and/or loading (BE_LOAD)
 void
 command_buffer_feed_enable(uint32_t *args)
 {
     struct buffer_feed *b = oid_lookup(args[0], command_config_buffer_feed);
+    uint8_t mask = args[1];
     irq_disable();
-    if (args[1]) {
-        b->flags |= BF_ENABLED;
+    uint16_t flags = b->flags & ~(BF_ENABLED | BF_LOAD_ON);
+    if (mask & BE_FEED)
+        flags |= BF_ENABLED;
+    if (mask & BE_LOAD)
+        flags |= BF_LOAD_ON;
+    b->flags = flags;
+    // Stop a run whose automatic function was switched off (all runs if
+    // everything was switched off)
+    if (b->state == BS_RUN) {
+        uint8_t auto_load = b->kind == RK_LOAD && !b->tag;
+        if (!mask || ((flags & BF_AUTO) && !(mask & BE_FEED))
+            || (auto_load && !(mask & BE_LOAD)))
+            bf_abort_now(b);
+    }
+    if (mask) {
         if (b->state == BS_FAULT)
             b->state = BS_IDLE;
-        b->runs = b->trig.cnt = b->entry.cnt = 0;
+        b->runs = b->rruns = b->trig.cnt = b->stop.cnt = b->entry.cnt = 0;
+        b->flags &= ~BF_RUNOUT;
         // Filament that is already at sensor 1 does not start a load
         if ((b->flags & BF_HAVE_LOAD) && bf_active(&b->entry))
             b->flags |= BF_NEED_ENTRY_RELEASE;
@@ -502,9 +580,6 @@ command_buffer_feed_enable(uint32_t *args)
             b->time.waketime = timer_read_time() + b->poll_ticks;
             sched_add_timer(&b->time);
         }
-    } else {
-        b->flags &= ~BF_ENABLED;
-        bf_abort_now(b);
     }
     irq_enable();
 }
@@ -520,7 +595,7 @@ bf_abort_now(struct buffer_feed *b)
     if (b->flags & BF_TIMER)
         sched_del_timer(&b->time);
     b->flags &= ~(BF_TIMER | BF_AUTO | BF_ABORT | BF_STOPPING
-                  | BF_REVERSE_AFTER);
+                  | BF_REVERSE_AFTER | BF_RETRACT);
     b->state = BS_IDLE;
     b->reason = BR_ABORT;
     b->rtag = b->tag;
@@ -528,7 +603,7 @@ bf_abort_now(struct buffer_feed *b)
     if (b->kind == RK_LOAD)
         b->flags |= BF_NEED_ENTRY_RELEASE;
     sched_wake_task(&buffer_feed_wake);
-    if (b->flags & BF_ENABLED) {
+    if (b->flags & (BF_ENABLED | BF_LOAD_ON)) {
         b->flags |= BF_TIMER;
         b->time.func = buffer_feed_poll_event;
         b->time.waketime = timer_read_time() + b->poll_ticks;
@@ -624,7 +699,10 @@ command_buffer_feed_query(uint32_t *args)
     sendf("buffer_feed_state oid=%c state=%c reason=%c enabled=%c runs=%c"
           " trigger=%c stop=%c gate=%c entry=%c exit=%c done=%u remaining=%u"
           " total=%u"
-          , oid, state, reason, !!(flags & BF_ENABLED), runs, trig, stop
+          , oid, state, reason
+          , ((flags & BF_ENABLED) ? BE_FEED : 0)
+            | ((flags & BF_LOAD_ON) ? BE_LOAD : 0)
+            | ((flags & BF_RUNOUT) ? 4 : 0), runs, trig, stop
           , gate, entry, exit, done, remaining, total);
 }
 DECL_COMMAND(command_buffer_feed_query, "buffer_feed_query oid=%c");
@@ -657,7 +735,7 @@ buffer_feed_shutdown(void)
     uint8_t oid;
     struct buffer_feed *b;
     foreach_oid(oid, b, command_config_buffer_feed) {
-        b->flags &= ~BF_ENABLED;
+        b->flags &= ~(BF_ENABLED | BF_LOAD_ON | BF_RUNOUT);
         b->state = BS_IDLE;
     }
 }

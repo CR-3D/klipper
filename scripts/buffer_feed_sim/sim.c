@@ -208,7 +208,7 @@ struct cfg {
     uint32_t start, cruise, add, dadd;       // feed ramp (add in 1/256 ticks)
     uint32_t steps, max_runs, with_stop, with_gate, with_load;
     uint32_t l_start, l_cruise, l_add, l_dadd; // load ramp
-    uint32_t clear_steps, clear_back, timeout_ticks;
+    uint32_t clear_steps, clear_back, timeout_ticks, retract_steps;
 };
 static struct cfg C;
 static void cfg_default(void) {
@@ -246,10 +246,13 @@ static void setup(void) {
         command_buffer_feed_set_load_profile(a);
     }
     a[0]=1; a[1]=C.steps; a[2]=C.start; a[3]=C.cruise; a[4]=C.add;
-    a[5]=C.dadd; a[6]=1; command_buffer_feed_set_profile(a);
+    a[5]=C.dadd; a[6]=1; a[7]=C.retract_steps;
+    command_buffer_feed_set_profile(a);
 }
-static void enable_feed(long on) {
-    uint32_t a[2] = { 1, (uint32_t)on }; command_buffer_feed_enable(a); }
+enum { BE_FEED = 1, BE_LOAD = 2 };
+static void enable_mask(uint32_t mask) {
+    uint32_t a[2] = { 1, mask }; command_buffer_feed_enable(a); }
+static void enable_feed(long on) { enable_mask(on ? BE_FEED | BE_LOAD : 0); }
 enum { SEL_NONE, SEL_STOP, SEL_TRIGGER, SEL_ENTRY, SEL_EXIT, SEL_GATE };
 static uint32_t move_tag = 7;
 static void start_move(uint32_t steps, uint32_t sel, uint32_t level,
@@ -707,6 +710,112 @@ static void test_move_reverse(void) {
     CHECK(ev_reason == 5 && inj_n == 0, "refused (busy), no steps");
 }
 
+static void test_runout(void) {
+    printf("\n== runout: no filament at the entry sensor -> no fault\n");
+    cfg_default(); C.with_load = 1; C.with_stop = 0; C.steps = 200;
+    C.add = C.dadd = 0; C.start = C.cruise = 20000; setup();
+    force_trig = 1; lo = 1e9; hi = 1e9;
+    entry_on = 0;
+    enable_mask(BE_FEED);
+    run_for(1.0);
+    CHECK(inj_n == 600, "3 runs x 200 steps fed (%ld)", inj_n);
+    CHECK(ev_reason == 8, "runout reported instead of a fault (reason=%ld)",
+          ev_reason);
+    run_for(0.5);
+    CHECK(inj_n == 600, "feeding pauses during the runout");
+    printf("  -- new filament at the entry sensor: feeding resumes\n");
+    entry_on = 1;
+    run_for(1.0);
+    CHECK(inj_n == 1200, "3 more runs after the runout ended (%ld)", inj_n);
+    CHECK(ev_reason == 4, "with filament present it is a fault (reason=%ld)",
+          ev_reason);
+    enable_feed(0);
+}
+
+static void test_enable_mask(void) {
+    printf("\n== feeding and loading are enabled separately\n");
+    cfg_default(); C.with_load = 1; C.with_stop = 0; C.steps = 200;
+    C.add = C.dadd = 0; C.start = C.cruise = 20000;
+    C.timeout_ticks = 64000000; setup();
+    hi = 1e9; exit_pos = 300;
+    force_trig = 1; lo = 1e9;
+    enable_mask(BE_LOAD);
+    run_for(0.3);
+    CHECK(inj_n == 0, "load only: buffer_low active, no feed (%ld)", inj_n);
+    entry_on = 1;
+    run_for(1.0);
+    CHECK(ev_reason == 7 && inj_n >= 300, "load only: entry starts a load"
+          " (reason=%ld, %ld steps)", ev_reason, inj_n);
+    enable_mask(0);
+    cfg_default(); C.with_load = 1; C.with_stop = 0;
+    C.timeout_ticks = 64000000; setup();
+    hi = 1e9; lo = -1e9; exit_pos = 300;
+    enable_mask(BE_FEED);
+    run_for(0.05);
+    entry_on = 1;
+    run_for(0.5);
+    CHECK(inj_n == 0, "feed only: entry does not start a load (%ld)", inj_n);
+    printf("  -- switching loading off stops a running load\n");
+    enable_mask(BE_FEED | BE_LOAD);
+    entry_on = 0; run_for(0.05); entry_on = 1; exit_pos = 1L << 40;
+    run_for(0.1);
+    long n = inj_n;
+    CHECK(n > 0, "load running (%ld steps)", n);
+    enable_mask(BE_FEED);
+    run_for(0.3);
+    CHECK(inj_n == n && ev_reason == 3, "load aborted (reason=%ld)",
+          ev_reason);
+    enable_mask(0);
+}
+
+static void test_retract(void) {
+    printf("\n== buffer_high: retract until it releases\n");
+    cfg_default(); C.retract_steps = 150; setup();
+    lo = 100; hi = 400;
+    base_p = 450;                      // pushed beyond full
+    enable_feed(1);
+    run_for(1.0);
+    CHECK(fed < 0 && ev_reason == 2,
+          "moved back and stopped at the sensor (%ld steps, reason=%ld)",
+          fed, ev_reason);
+    CHECK(buf_p() < hi && buf_p() > lo, "buffer between low and high"
+          " (p=%.0f)", buf_p());
+    long n = inj_n;
+    run_for(0.5);
+    CHECK(inj_n == n, "idle afterwards");
+    printf("  -- long retraction pushes the buffer far beyond full\n");
+    base_p += 350;                     // needs more than 2 retract runs
+    ev_reason = -1;
+    run_for(2.0);
+    CHECK(buf_p() < hi && buf_p() > lo && ev_reason == 2,
+          "retracted in several runs, no fault (p=%.0f, reason=%ld)",
+          buf_p(), ev_reason);
+    printf("  -- feed run overruns buffer_high, then backs off\n");
+    base_p = 0 - fed;                  // buffer empty
+    C.steps = 3000;
+    {
+        uint32_t a[8] = { 1, C.steps, C.start, C.cruise, C.add, C.dadd, 1,
+                          C.retract_steps };
+        command_buffer_feed_set_profile(a);
+    }
+    run_for(2.0);
+    CHECK(buf_p() < hi && buf_p() > lo, "fed to high and backed off"
+          " (p=%.0f)", buf_p());
+    n = inj_n;
+    run_for(0.5);
+    CHECK(inj_n == n, "no oscillation afterwards");
+    printf("  -- buffer_high never releases -> fault\n");
+    hi = -1e9;
+    ev_reason = -1;
+    run_for(2.0);
+    CHECK(ev_reason == 9, "retract fault reported (reason=%ld)", ev_reason);
+    n = inj_n;
+    run_for(0.5);
+    CHECK(inj_n == n, "no further steps after the fault");
+    enable_feed(0);
+}
+
+
 int main(void) {
     evs = malloc(sizeof(struct ev) * 400000);
     test_ramp();
@@ -725,6 +834,9 @@ int main(void) {
     test_load_timeout();
     test_load_retract_wait();
     test_move_reverse();
+    test_runout();
+    test_enable_mask();
+    test_retract();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL TESTS PASSED",
            failures);
     return failures != 0;
