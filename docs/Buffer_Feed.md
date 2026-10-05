@@ -72,7 +72,11 @@ gibt es `BUFFER_FEED_MOVE` (siehe unten) und `config/sample-buffer-feed.cfg`.
 * Firmware-Update der MCU, auf der der Stepper und die Sensoren hängen
   (`make menuconfig`: "Support autonomous filament buffer feeding" ist
   standardmäßig aktiv, außer auf AVR). Host-Klipper und MCU müssen
-  zusammenpassen.
+  zusammenpassen: Nach jedem Update dieses Moduls die MCU neu bauen und
+  flashen. Sonst bricht Klipper beim Start mit "Protocol error" ab. Die
+  `out/klipper.dict` muss dafür nicht kopiert werden, der Host liest die
+  Befehlsbeschreibung beim Verbinden aus der Firmware. Sie wird nur für
+  Tests im Batchmodus (`klippy.py -d`) gebraucht.
 * Der Stepper muss "step on both edges" verwenden. Das ist bei
   TMC-Treibern mit Step/Dir der Standard, solange kein großer
   `step_pulse_duration` gesetzt ist. Sonst bricht Klipper beim Start mit einer
