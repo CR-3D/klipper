@@ -206,7 +206,7 @@ static void run_for(double s) { run_until(vtime + (uint32_t)(s * F)); }
 // ---------------------------------------------------------------- config
 struct cfg {
     uint32_t start, cruise, add, dadd;       // feed ramp (add in 1/256 ticks)
-    uint32_t steps, max_runs, fill_runs, with_stop, with_gate, with_load;
+    uint32_t steps, max_runs, with_stop, with_gate, with_load;
     uint32_t l_start, l_cruise, l_add, l_dadd; // load ramp
     uint32_t clear_steps, clear_back, timeout_ticks;
 };
@@ -215,7 +215,7 @@ static void cfg_default(void) {
     memset(&C, 0, sizeof C);
     C.steps = 500; C.start = 200000; C.cruise = 15000;
     C.add = C.dadd = (200000 - 15000) * 256 / 100;      // 100 step ramps
-    C.max_runs = 3; C.fill_runs = 30; C.with_stop = 1;
+    C.max_runs = 3; C.with_stop = 1;
     C.l_start = 200000; C.l_cruise = 30000;
     C.l_add = C.l_dadd = (200000 - 30000) * 256 / 100;
 }
@@ -232,7 +232,7 @@ static void setup(void) {
     command_config_stepper(a);
     a[0]=0; a[1]=ns_mirror = vtime; command_reset_step_clock(a);
     a[0]=1; a[1]=0; a[2]=TRIG; a[3]=1; a[4]=0; a[5]=32000; a[6]=4;
-    a[7]=C.max_runs; a[8]=C.fill_runs; command_config_buffer_feed(a);
+    a[7]=C.max_runs; command_config_buffer_feed(a);
     if (C.with_stop) { a[0]=1; a[1]=STOP; a[2]=1; a[3]=0; a[4]=2;
                        command_config_buffer_feed_stop(a); }
     if (C.with_gate) { a[0]=1; a[1]=GATE; a[2]=1; a[3]=0;
@@ -415,7 +415,7 @@ static void test_dir_and_position(void) {
 static void test_fault(void) {
     printf("\n== trigger never releases -> fault after max_runs\n");
     cfg_default(); C.steps = 200; C.add = C.dadd = 0; C.start = C.cruise = 20000;
-    C.with_stop = 0; C.fill_runs = 3; setup();
+    C.with_stop = 0; setup();
     force_trig = 1; lo = 1e9;
     enable_feed(1);
     run_for(1.0);
@@ -432,28 +432,6 @@ static void test_fault(void) {
     CHECK(inj_n == 800 && ev_reason == 1,
           "re-enable after fault restarts feeding (%ld steps)", inj_n);
     enable_feed(0);
-}
-
-static void test_fill_after_load(void) {
-    printf("\n== empty buffer after enable/load: many runs allowed, no fault\n");
-    cfg_default(); C.with_gate = 1; C.steps = 200; C.add = C.dadd = 0;
-    C.start = C.cruise = 20000; setup();
-    gate_on = 1;
-    base_p = -3000;                    // empty buffer: needs 15+ runs of 200
-    enable_feed(1);
-    run_for(3.0);
-    CHECK(ev_reason != 4 && inj_n > 600,
-          "no fault while filling (%ld steps, reason=%ld)", inj_n, ev_reason);
-    CHECK(buf_p() > lo && ev_reason != 4,
-          "trigger released, filling finished (p=%.0f, reason=%ld)", buf_p(),
-          ev_reason);
-    long n = inj_n; run_for(0.5);
-    CHECK(inj_n == n, "idle once the buffer is full");
-    printf("  -- after the buffer was filled the normal run limit applies\n");
-    base_p -= 1000; run_for(0.3);      // spring buffer consumed: trigger again
-    CHECK(inj_n > n, "normal feeding continues after filling (%ld)", inj_n);
-    enable_feed(0);
-    run_for(0.02);
 }
 
 static void test_unload_while_feeding(void) {
@@ -737,7 +715,6 @@ int main(void) {
     test_closed_loop("closed loop: feed in parallel to host extrusion", 1);
     test_dir_and_position();
     test_fault();
-    test_fill_after_load();
     test_unload_while_feeding();
     test_unload_exit_already_open();
     test_manual_abort();

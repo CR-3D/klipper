@@ -61,19 +61,18 @@ class BufferFeed:
                                                 above=0., maxval=60.)
             self.load_clear_distance = config.getfloat(
                 'load_clear_distance', 0.)
-            self.entry_debounce = config.getfloat('entry_debounce', .002,
+            self.entry_debounce = config.getfloat('entry_debounce', .010,
                                                   minval=0., maxval=.100)
             self.exit_samples = config.getint('exit_samples', 2,
                                               minval=1, maxval=255)
         # Sensor handling
-        self.poll_interval = config.getfloat('poll_interval', .0005,
+        self.poll_interval = config.getfloat('poll_interval', .005,
                                              minval=.0001, maxval=.010)
-        self.trigger_debounce = config.getfloat('trigger_debounce', .002,
+        self.trigger_debounce = config.getfloat('trigger_debounce', .010,
                                                 minval=0., maxval=.100)
         self.stop_samples = config.getint('stop_samples', 2,
                                           minval=1, maxval=255)
         self.max_runs = config.getint('max_runs', 3, minval=0, maxval=255)
-        self.fill_runs = config.getint('fill_runs', 30, minval=0, maxval=255)
         self.start_enabled = config.getboolean('enable', True)
         self.enable_stepper = config.getboolean('enable_stepper', True)
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -167,11 +166,10 @@ class BufferFeed:
         self.mcu.add_config_cmd(
             "config_buffer_feed oid=%d stepper_oid=%d trigger_pin=%s"
             " trigger_pull_up=%d trigger_active=%d poll_ticks=%d"
-            " trigger_debounce=%d max_runs=%d fill_runs=%d" % (
+            " trigger_debounce=%d max_runs=%d" % (
                 self.oid, self.mcu_stepper.get_oid(), tp['pin'], tp['pullup'],
                 0 if tp['invert'] else 1, sec(self.poll_interval),
-                self._debounce_count(self.trigger_debounce), self.max_runs,
-                self.fill_runs))
+                self._debounce_count(self.trigger_debounce), self.max_runs))
         sp = self.stop
         if sp is not None:
             self.mcu.add_config_cmd(

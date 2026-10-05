@@ -31,7 +31,7 @@ enum {
     BF_ENABLED = 1<<0, BF_HAVE_STOP = 1<<1, BF_AUTO = 1<<2,
     BF_REPORT = 1<<3, BF_NEED_RELEASE = 1<<4, BF_TIMER = 1<<5,
     BF_ABORT = 1<<6, BF_HAVE_GATE = 1<<7, BF_HAVE_LOAD = 1<<8,
-    BF_NEED_ENTRY_RELEASE = 1<<9, BF_STOPPING = 1<<10, BF_FILL = 1<<12,
+    BF_NEED_ENTRY_RELEASE = 1<<9, BF_STOPPING = 1<<10,
     BF_REVERSE_AFTER = 1<<11,
 };
 
@@ -70,7 +70,7 @@ struct buffer_feed {
     struct bf_sensor trig, stop, gate, entry, exit;
     uint32_t poll_ticks;
     uint16_t flags;
-    uint8_t state, reason, tag, rtag, max_runs, fill_runs, runs, kind, stage, clear_back;
+    uint8_t state, reason, tag, rtag, max_runs, runs, kind, stage, clear_back;
     // Sensor that ends the active feed move
     struct bf_sensor *sel_sensor;
     uint8_t sel_level, sel_samples, sel_cnt;
@@ -195,9 +195,9 @@ bf_finish(struct buffer_feed *b, uint8_t reason)
         // Do not load again until the entry sensor has been released
         b->flags |= BF_NEED_ENTRY_RELEASE;
     if (!(b->flags & BF_AUTO))
-        // After a load or manual move the buffer may still be empty
-        b->flags |= BF_FILL;
-    else if ((b->flags & BF_AUTO) && (reason == BR_STOP || reason == BR_ABORT))
+        // A load or manual move starts a new series of feed runs
+        b->runs = 0;
+    else if (reason == BR_STOP || reason == BR_ABORT)
         // Do not restart until the trigger sensor has been released
         b->flags |= BF_NEED_RELEASE;
     b->time.func = buffer_feed_poll_event;
@@ -313,13 +313,12 @@ buffer_feed_poll_event(struct timer *t)
     if (!bf_active(&b->trig)) {
         b->trig.cnt = 0;
         b->runs = 0;
-        b->flags &= ~(BF_NEED_RELEASE | BF_FILL);
+        b->flags &= ~BF_NEED_RELEASE;
     } else if (!gate_ok) {
         b->trig.cnt = 0;
     } else if (!(flags & BF_NEED_RELEASE) && b->feed_p.steps
                && bf_sensor_hit(&b->trig)) {
-        uint8_t lim = (flags & BF_FILL) ? b->fill_runs : b->max_runs;
-        if (lim && b->runs >= lim) {
+        if (b->max_runs && b->runs >= b->max_runs) {
             // Trigger still active after all permitted runs
             b->state = BS_FAULT;
             b->reason = BR_FAULT;
@@ -411,12 +410,11 @@ command_config_buffer_feed(uint32_t *args)
     bf_sensor_setup(&b->trig, args[2], args[3], args[4], args[6]);
     b->poll_ticks = args[5];
     b->max_runs = args[7];
-    b->fill_runs = args[8];
 }
 DECL_COMMAND(command_config_buffer_feed,
              "config_buffer_feed oid=%c stepper_oid=%c trigger_pin=%c"
              " trigger_pull_up=%c trigger_active=%c poll_ticks=%u"
-             " trigger_debounce=%c max_runs=%c fill_runs=%c");
+             " trigger_debounce=%c max_runs=%c");
 
 void
 command_config_buffer_feed_stop(uint32_t *args)
@@ -495,7 +493,6 @@ command_buffer_feed_enable(uint32_t *args)
         if (b->state == BS_FAULT)
             b->state = BS_IDLE;
         b->runs = b->trig.cnt = b->entry.cnt = 0;
-        b->flags |= BF_FILL;
         // Filament that is already at sensor 1 does not start a load
         if ((b->flags & BF_HAVE_LOAD) && bf_active(&b->entry))
             b->flags |= BF_NEED_ENTRY_RELEASE;

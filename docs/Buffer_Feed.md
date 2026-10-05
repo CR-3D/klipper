@@ -17,7 +17,7 @@ Jede Bewegung über G-Code (auch `MANUAL_STEPPER ... SYNC=0`) wird auf der
 `print_time` am Ende der Lookahead-Queue des Toolheads eingeplant. Je nach
 Druck sind das bis zu 1-2 s Vorlauf. Dazu kommt, dass der Button-Befehl erst
 zwischen zwei Druckbefehlen abgearbeitet wird. Bei `buffer_feed` entscheidet
-die MCU selbst. Reaktionszeit mit den Standardwerten: ca. 1,5-2,5 ms,
+die MCU selbst. Reaktionszeit mit den Standardwerten: ca. 5-10 ms,
 unabhängig von Druck, Bahnplanung und CAN-Last.
 
 ## Funktionen
@@ -96,11 +96,10 @@ Siehe `config/sample-buffer-feed.cfg`.
 | `accel` | 0 | Beschleunigung (mm/s²), 0 = sofort volle Geschwindigkeit |
 | `decel` | `accel` | Bremsrampe, v.a. beim Überfahren des Stop-Sensors (mm/s²) |
 | `start_velocity` | 2.0 | Start-/Endgeschwindigkeit der Rampen (mm/s) |
-| `poll_interval` | 0.0005 | Abfrageintervall in der MCU (s) |
-| `trigger_debounce` | 0.002 | Entprellzeit des Trigger-Sensors (s) |
+| `poll_interval` | 0.005 | Abfrageintervall in der MCU (s) |
+| `trigger_debounce` | 0.010 | Entprellzeit des Trigger-Sensors (s) |
 | `stop_samples` | 2 | Aufeinanderfolgende Abtastungen (je eine pro Schritt) bis der Stop-Sensor gilt |
 | `max_runs` | 3 | Läufe bei dauerhaft aktivem Trigger bis zum Fehler (0 = aus) |
-| `fill_runs` | 30 | wie `max_runs`, aber für das erste Füllen des leeren Puffers nach Enable, Laden oder manuellem Move (0 = aus) |
 | `fault_gcode` | | G-Code bei Nachschub-Fehler |
 | `entry_pin` | | Sensor 1: startet das Laden (mit `exit_pin` zusammen) |
 | `exit_pin` | | Sensor 2: beendet das Laden |
@@ -110,7 +109,7 @@ Siehe `config/sample-buffer-feed.cfg`.
 | `load_start_velocity` | `start_velocity` | Start-/Endgeschwindigkeit beim Laden (mm/s) |
 | `load_timeout` | 10 | Zeit (s) bis Sensor 2 auslösen muss, max. 60 |
 | `load_clear_distance` | 0 | Strecke nach Sensor 2 (mm); negativ = zurück |
-| `entry_debounce` | 0.002 | Entprellzeit von Sensor 1 (s) |
+| `entry_debounce` | 0.010 | Entprellzeit von Sensor 1 (s) |
 | `exit_samples` | 2 | Abtastungen (je eine pro Schritt) bis Sensor 2 gilt |
 | `load_fault_gcode` | | G-Code bei Lade-Timeout |
 | `enable` | True | Beim Start automatisch aktivieren |
