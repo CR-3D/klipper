@@ -209,13 +209,14 @@ struct cfg {
     uint32_t steps, max_runs, with_stop, with_gate, with_load;
     uint32_t l_start, l_cruise, l_add, l_dadd; // load ramp
     uint32_t clear_steps, clear_back, timeout_ticks, retract_steps;
+    uint32_t retract_max_runs;
 };
 static struct cfg C;
 static void cfg_default(void) {
     memset(&C, 0, sizeof C);
     C.steps = 500; C.start = 200000; C.cruise = 15000;
     C.add = C.dadd = (200000 - 15000) * 256 / 100;      // 100 step ramps
-    C.max_runs = 3; C.with_stop = 1;
+    C.max_runs = 3; C.with_stop = 1; C.retract_max_runs = 10;
     C.l_start = 200000; C.l_cruise = 30000;
     C.l_add = C.l_dadd = (200000 - 30000) * 256 / 100;
 }
@@ -234,6 +235,7 @@ static void setup(void) {
     a[0]=1; a[1]=0; a[2]=TRIG; a[3]=1; a[4]=0; a[5]=32000; a[6]=4;
     a[7]=C.max_runs; command_config_buffer_feed(a);
     if (C.with_stop) { a[0]=1; a[1]=STOP; a[2]=1; a[3]=0; a[4]=2;
+                       a[5]=C.retract_max_runs;
                        command_config_buffer_feed_stop(a); }
     if (C.with_gate) { a[0]=1; a[1]=GATE; a[2]=1; a[3]=0;
                        command_config_buffer_feed_gate(a); }
@@ -711,24 +713,83 @@ static void test_move_reverse(void) {
 }
 
 static void test_runout(void) {
-    printf("\n== runout: no filament at the entry sensor -> no fault\n");
+    printf("\n== runout: entry sensor releases -> reported at once, no fault\n");
+    cfg_default(); C.with_load = 1; C.with_stop = 0; C.steps = 200;
+    C.add = C.dadd = 0; C.start = C.cruise = 20000; setup();
+    lo = 100; hi = 1e9;
+    base_p = 300;                      // buffer fine
+    entry_on = 1; exit_pos = -(1L << 40); // loaded through
+    enable_mask(BE_FEED);
+    run_for(0.1);
+    CHECK(inj_n == 0 && ev_count == 0, "idle while filament present");
+    entry_on = 0;
+    uint32_t t = vtime;
+    run_for(0.05);
+    CHECK(ev_reason == 8, "runout reported (reason=%ld)", ev_reason);
+    CHECK((double)(ev_time - t) / F < 0.005, "within %.1f ms",
+          (double)(ev_time - t) / F * 1000);
+    printf("  -- end still in the feeder: one run per buffer_low edge\n");
+    ev_reason = -1;
+    int edges = 0;
+    for (int k = 0; k < 6; k++) {
+        base_p = 50 - fed;             // extruder used the buffer up
+        run_for(0.5);
+        edges++;
+    }
+    CHECK(inj_n == edges * 200, "%d edges -> %d runs (%ld steps), more than"
+          " max_runs", edges, edges, inj_n);
+    CHECK(ev_reason != 4, "no fault (reason=%ld)", ev_reason);
+    printf("  -- end has left the feeder: a run no longer lifts the buffer\n");
+    long n = inj_n;
+    force_trig = 1;
+    run_for(1.5);
+    CHECK(inj_n == n + 200, "one more run, then it stays low (%ld)",
+          inj_n - n);
+    CHECK(ev_reason != 4, "no fault (reason=%ld)", ev_reason);
+    printf("  -- new filament at the entry sensor: normal feeding again\n");
+    n = inj_n;
+    entry_on = 1;
+    run_for(1.0);
+    CHECK(inj_n == n + 600, "3 runs after the runout ended (%ld)", inj_n - n);
+    CHECK(ev_reason == 4, "with filament present it is a fault (reason=%ld)",
+          ev_reason);
+    enable_feed(0);
+
+    printf("\n== no filament at the entry sensor since enable\n");
     cfg_default(); C.with_load = 1; C.with_stop = 0; C.steps = 200;
     C.add = C.dadd = 0; C.start = C.cruise = 20000; setup();
     force_trig = 1; lo = 1e9; hi = 1e9;
     entry_on = 0;
     enable_mask(BE_FEED);
     run_for(1.0);
-    CHECK(inj_n == 600, "3 runs x 200 steps fed (%ld)", inj_n);
-    CHECK(ev_reason == 8, "runout reported instead of a fault (reason=%ld)",
+    CHECK(inj_n == 600 && ev_reason == 8,
+          "after max_runs: runout, not a fault (%ld, reason=%ld)", inj_n,
           ev_reason);
-    run_for(0.5);
-    CHECK(inj_n == 600, "feeding pauses during the runout");
-    printf("  -- new filament at the entry sensor: feeding resumes\n");
-    entry_on = 1;
+    enable_feed(0);
+
+    printf("\n== filament moved back past the entry sensor: no runout\n");
+    cfg_default(); C.with_load = 1; C.with_stop = 0; setup();
+    lo = -1e9; hi = 1e9;
+    entry_on = 1; entry_floor = -300;  // tip leaves entry after 300 steps back
+    exit_pos = -100;                   // ... and exit after 100 steps
+    enable_mask(BE_FEED);
+    run_for(0.05);
+    start_move(400, SEL_NONE, 1, 1);
     run_for(1.0);
-    CHECK(inj_n == 1200, "3 more runs after the runout ended (%ld)", inj_n);
-    CHECK(ev_reason == 4, "with filament present it is a fault (reason=%ld)",
-          ev_reason);
+    CHECK(fed == -400 && ev_reason == 1, "moved back (%ld)", fed);
+    run_for(0.2);
+    CHECK(ev_reason == 1, "no runout reported (reason=%ld)", ev_reason);
+    enable_feed(0);
+
+    printf("\n== filament pulled out of a channel that is not loaded through\n");
+    cfg_default(); C.with_load = 1; C.with_stop = 0; setup();
+    lo = -1e9; hi = 1e9;
+    entry_on = 1;                      // exit sensor free (preloaded)
+    enable_mask(BE_FEED);
+    run_for(0.05);
+    entry_on = 0;
+    run_for(0.2);
+    CHECK(ev_count == 0, "no runout reported (%ld events)", ev_count);
     enable_feed(0);
 }
 
@@ -804,11 +865,14 @@ static void test_retract(void) {
     n = inj_n;
     run_for(0.5);
     CHECK(inj_n == n, "no oscillation afterwards");
-    printf("  -- buffer_high never releases -> fault\n");
+    printf("  -- buffer_high never releases -> fault after retract_max_runs\n");
     hi = -1e9;
     ev_reason = -1;
-    run_for(2.0);
+    long f0 = fed;
+    run_for(4.0);
     CHECK(ev_reason == 9, "retract fault reported (reason=%ld)", ev_reason);
+    CHECK(f0 - fed == 10 * 150, "10 retract runs before the fault (%ld steps)",
+          f0 - fed);
     n = inj_n;
     run_for(0.5);
     CHECK(inj_n == n, "no further steps after the fault");

@@ -51,13 +51,27 @@ and CAN load.
 * While the host moves the same stepper in the opposite direction (retract),
   feeding waits until that move is done. The direction pin is never changed
   under a running move and is restored before the next host move.
-* If `buffer_low_pin` is still active after `max_runs` runs in a row:
-  * filament at the entry sensor: fault (jam, broken sensor). Feeding stops,
-    an error is shown and `fault_gcode` runs.
-  * no filament at the entry sensor: **runout**, not a fault. Feeding of this
-    channel pauses until filament is inserted again and `runout_gcode` runs.
-    The print is paused by the printer's own filament sensor.
+* If `buffer_low_pin` is still active after `max_runs` runs in a row, this
+  is a fault (jam, broken sensor): feeding stops, an error is shown and
+  `fault_gcode` runs. Without filament at the entry sensor it is a runout
+  instead (see below).
 * A new feed run only starts after `buffer_low_pin` was released in between.
+
+### Runout
+
+When the entry sensor of the active channel releases while its exit sensor
+still detects filament (the channel is loaded through), the MCU reports a
+runout at once and `runout_gcode` runs. From then on feeding reacts to
+edges of `buffer_low_pin` only: every time it triggers, one run follows, with
+no run limit and **no fault**. While the end of the filament is still in the
+pre-feeder, each run lifts the buffer above `buffer_low_pin`, the extruder
+uses it up and the next edge follows. Once the end has left the pre-feeder,
+a run no longer releases `buffer_low_pin` and feeding stops. The print is
+paused by the printer's own filament sensor. The runout ends when filament
+is inserted at the entry sensor again.
+
+Filament pulled out of a channel that is not loaded through (exit sensor
+free, eg preloaded or after a failed load) is not a runout.
 
 ### Retract
 
@@ -65,8 +79,8 @@ If `buffer_high_pin` triggers while feeding is enabled (buffer pushed beyond
 full, eg by a long retraction or by unloading through the extruder), the
 active channel moves back until `buffer_high_pin` releases (with
 deceleration), at most `retract_distance` mm per run. If it is still active
-after `max_runs` retract runs, this is a fault. `retract_distance: 0` disables
-the function.
+after `retract_max_runs` retract runs in a row, this is a fault.
+`retract_distance: 0` disables the function.
 
 ### Loading
 
@@ -89,8 +103,31 @@ If `entry_pin_<channel>` and `exit_pin_<channel>` are configured:
 Loading works independently of feeding. In a buffer with two channels both
 channels load automatically, only the active channel feeds.
 
-Filling the buffer and unloading are done with macros (see
-`BUFFER_FEED_MOVE` and `config/sample-buffer-feed.cfg`).
+Filling the buffer is done with a macro (see `BUFFER_FEED_MOVE` and
+`config/sample-buffer-feed.cfg`).
+
+### Unloading
+
+`BUFFER_FEED_UNLOAD` switches feeding and loading of the channel off, moves
+back until the exit sensor releases (at most `unload_exit_distance`), then
+until the entry sensor releases (at most `unload_entry_distance`) and
+switches loading on again. The command returns at once, so a running unload
+can be aborted with `BUFFER_FEED_ABORT` (eg by holding a button, see the
+sample configs). If a sensor does not release within its distance, the
+unload stops with an error.
+
+### Channel state
+
+Every channel has a simple state for status LEDs:
+
+* `empty`: no filament at the entry sensor,
+* `preloaded`: filament at the entry sensor, exit sensor free,
+* `loaded`: exit sensor detects filament or the channel feeds,
+* `error`: feed, retract or load fault. Cleared by the next move, by
+  enabling the channel or when the entry sensor changes.
+
+When the state of a channel changes, `state_gcode` runs with
+`params.CHANNEL` and `params.STATE`.
 
 ### Motors off
 
@@ -160,7 +197,10 @@ See `config/sample-buffer-feed.cfg` (one channel) and
 | `decel` | `accel` | Deceleration, eg when `buffer_high_pin` triggers (mm/s²) |
 | `start_velocity` | 2.0 | Start and end velocity of the ramps (mm/s) |
 | `retract_distance` | 0 | Maximum distance of a retract run (mm), 0 = off |
-| `max_runs` | 3 | Feed or retract runs in a row without effect until a fault (0 = off) |
+| `max_runs` | 3 | Feed runs in a row without effect until a fault (0 = off) |
+| `retract_max_runs` | 10 | Retract runs in a row while `buffer_high_pin` stays active until a fault (0 = off) |
+| `unload_exit_distance` | 2000 | `BUFFER_FEED_UNLOAD`: maximum distance back until the exit sensor releases (mm) |
+| `unload_entry_distance` | 600 | `BUFFER_FEED_UNLOAD`: maximum distance back until the entry sensor releases (mm) |
 | `poll_interval` | 0.005 | Sensor poll interval on the MCU (s) |
 | `buffer_low_debounce` | 0.010 | Debounce time of `buffer_low_pin` (s) |
 | `buffer_high_samples` | 2 | Consecutive samples (one per poll or step) until `buffer_high_pin` counts |
@@ -176,6 +216,7 @@ See `config/sample-buffer-feed.cfg` (one channel) and
 | `load_fault_gcode` | | G-Code on a load timeout |
 | `runout_gcode` | | G-Code on a runout |
 | `gate_release_gcode` | | G-Code when `gate_pin` releases |
+| `state_gcode` | | G-Code when the state of a channel changes (`params.STATE`) |
 | `enable` | True | Enable feeding and loading at startup |
 | `enable_stepper` | True | Switch the driver on when needed |
 
@@ -227,10 +268,15 @@ one channel.
 * `BUFFER_FEED_LOAD BUFFER=<name> [CHANNEL=] [WAIT=1] [WAIT_TIMEOUT=]`
   starts the load sequence manually, eg for testing. With `WAIT=1` a timeout
   (`load_timeout`) makes the macro fail.
+* `BUFFER_FEED_UNLOAD BUFFER=<name> [CHANNEL=] [EXIT_DISTANCE=]
+  [ENTRY_DISTANCE=] [WAIT=1] [WAIT_TIMEOUT=]` unloads the channel (see
+  "Unloading"). With `WAIT=1` the macro waits for the end and fails if the
+  unload stops early.
 * `BUFFER_FEED_WAIT BUFFER=<name> [CHANNEL=] [TIMEOUT=]` waits for the end of
   running moves (all channels if `CHANNEL` is omitted).
-* `BUFFER_FEED_ABORT BUFFER=<name> [CHANNEL=]` aborts running moves at once,
-  without deceleration (all channels if `CHANNEL` is omitted).
+* `BUFFER_FEED_ABORT BUFFER=<name> [CHANNEL=]` aborts running moves, loads
+  and unloads at once, without deceleration (all channels if `CHANNEL` is
+  omitted).
 * `QUERY_BUFFER_FEED BUFFER=<name>` shows the state of the buffer and all
   sensors. Useful to check wiring and pin polarity.
 
@@ -244,21 +290,28 @@ one channel.
 * `channels.<ch>.entry`, `channels.<ch>.exit`: sensor states
 * `channels.<ch>.feed`, `channels.<ch>.auto_load`: functions enabled
 * `channels.<ch>.runout`: True after a runout until filament is inserted
+* `channels.<ch>.state`: `empty`, `preloaded`, `loaded` or `error`
+* `channels.<ch>.unloading`: `BUFFER_FEED_UNLOAD` is running
 * `channels.<ch>.last_result`: `done`, `stop_sensor`, `aborted`, `fault`,
   `busy`, `load_timeout`, `loaded`, `runout`, `retract_fault`
 * `channels.<ch>.last_steps`, `fault_count`, `load_fault_count`
 * `last_result`, `distance`, `velocity`, `accel`, `decel`,
-  `retract_distance`
+  `retract_distance`, `retract_max_runs`
 
 The sensor states come from the host and may lag a few milliseconds behind
 the MCU.
 
 ## Notes
 
-* **Unloading:** switch feeding and loading of the channel off first
-  (`FEED=0 AUTO_LOAD=0`, this aborts a running move), otherwise the buffer
-  feeds again while moving back. Manual moves also run with the automatic
-  functions switched off. Use `WAIT=1` if another move follows.
+* **Own unload macros:** with `BUFFER_FEED_MOVE` switch feeding and loading
+  of the channel off first (`FEED=0 AUTO_LOAD=0`, this aborts a running
+  move), otherwise the buffer feeds again while moving back. Manual moves
+  also run with the automatic functions switched off. Use `WAIT=1` if
+  another move follows. `BUFFER_FEED_UNLOAD` does all of this itself.
+* **Buttons:** macros started by a `gcode_button` that use `WAIT=1` block
+  G-Code until the move is done, so a second button press only arrives
+  afterwards. Commands that return at once (`BUFFER_FEED_MOVE` without
+  `WAIT`, `BUFFER_FEED_UNLOAD`) can be aborted by another button.
 * **Moves are tagged:** every move started by the host carries a tag. Reports
   of other runs (automatic runs, an aborted earlier move) do not end a
   `WAIT=1` early.
@@ -279,12 +332,16 @@ the MCU.
 GPIO and spring buffer (both stepper code paths): ramps, exact step counts,
 closed loop with consumption, parallel host extrusion, retract, position
 tracking, stop sensor with deceleration, gate, loading (latency, clear
-forward and backward, timeout, restart), runout, separate enable of feeding
-and loading, retract on `buffer_high_pin`, abort, faults and re-enable.
+forward and backward, timeout, restart), runout (at once, one run per
+`buffer_low_pin` edge, no fault, not for a channel that is not loaded
+through), separate
+enable of feeding and loading, retract on `buffer_high_pin` with
+`retract_max_runs`, abort, faults and re-enable.
 
 `python3 scripts/buffer_feed_sim/host_test.py` tests the host module against
 mocked Klipper objects: channel selection, refusing a second channel, runout,
-gate event and channel switch, pause and wake up after motors off, faults
-and the G-Code commands.
+gate event and channel switch, pause and wake up after motors off, faults,
+unload sequence and abort, channel states (`state_gcode`) and the G-Code
+commands.
 
 Both tests do not replace a test on real hardware.

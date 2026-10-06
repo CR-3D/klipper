@@ -15,10 +15,13 @@ REASON_NAMES = {0: "none", 1: "done", 2: "stop_sensor", 3: "aborted",
                 4: "fault", 5: "busy", 6: "load_timeout", 7: "loaded",
                 8: "runout", 9: "retract_fault"}
 STATE_NAMES = {0: "idle", 1: "running", 2: "fault"}
+REASON_DONE = 1
+REASON_STOP = 2
 REASON_ABORTED = 3
 REASON_FAULT = 4
 REASON_BUSY = 5
 REASON_LOAD_TIMEOUT = 6
+REASON_LOADED = 7
 REASON_RUNOUT = 8
 REASON_RETRACT_FAULT = 9
 BE_FEED = 1                   # enable mask bits (see buffer_feed.c)
@@ -45,6 +48,12 @@ class BufferChannel:
         # Requested state (kept while the motors are off)
         self.feed = self.load = False
         self.runout = False
+        self.error = False          # fault or load timeout (for the state)
+        self.reported_state = None  # last state passed to state_gcode
+        self.unload_stage = 0       # running BUFFER_FEED_UNLOAD stage
+        self.unload_args = None
+        self.unload_restore_load = False
+        self.move_error = None
         self.last_reason = 0
         self.last_steps = 0
         self.fault_count = 0
@@ -89,9 +98,10 @@ class BufferChannel:
         if hp is not None:
             self.mcu.add_config_cmd(
                 "config_buffer_feed_stop oid=%d stop_pin=%s stop_pull_up=%d"
-                " stop_active=%d stop_samples=%d" % (
+                " stop_active=%d stop_samples=%d retract_max_runs=%d" % (
                     self.oid, hp['pin'], hp['pullup'],
-                    0 if hp['invert'] else 1, bf.high_samples))
+                    0 if hp['invert'] else 1, bf.high_samples,
+                    bf.retract_max_runs))
         gp = bf.gate
         if gp is not None:
             self.mcu.add_config_cmd(
@@ -207,8 +217,10 @@ class BufferChannel:
             mask = self.get_mask()
         if mask:
             self.runout = False
+            self.error = False
         else:
             self.move_pending = False   # the MCU aborts a running move
+            self.unload_stage = 0
         self.enable_cmd.send([self.oid, mask])
     def enable_motor(self):
         self.bf.enable_motor(self.mcu_stepper.get_name())
@@ -229,6 +241,8 @@ class BufferChannel:
             # end the move the host is waiting for
             self.move_pending = False
             self.move_result = reason
+            if self.unload_stage:
+                self._unload_next(reason)
         logging.info("buffer_feed %s %s: %s after %d steps", bf.name,
                      self.name, REASON_NAMES.get(reason, reason),
                      params['done'])
@@ -237,22 +251,26 @@ class BufferChannel:
                 "!! buffer_feed %s %s: command refused, the MCU is busy with"
                 " another move (use WAIT=1 or BUFFER_FEED_WAIT)"
                 % (bf.name, self.name))
+        if reason == REASON_LOADED:
+            self.error = False
         if reason in (REASON_FAULT, REASON_RETRACT_FAULT):
             self.fault_count += 1
             # The MCU stopped - keep automatic loading, feeding stays off
             self.feed = False
             if not bf.sleeping:
                 self.send_mask()
+            self.error = True
             if reason == REASON_FAULT:
                 msg = ("buffer_low still active after %d feed runs"
                        % (bf.max_runs,))
             else:
                 msg = ("buffer_high still active after %d retract runs"
-                       % (bf.max_runs,))
+                       % (bf.retract_max_runs,))
             bf.run_event_template(bf.fault_gcode, self, msg,
                                   REASON_NAMES[reason])
         elif reason == REASON_LOAD_TIMEOUT:
             self.load_fault_count += 1
+            self.error = True
             bf.run_event_template(
                 bf.load_fault_gcode, self,
                 "loading failed - the exit sensor did not trigger within"
@@ -260,6 +278,7 @@ class BufferChannel:
         elif reason == REASON_RUNOUT:
             self.runout = True
             bf.run_event_template(bf.runout_gcode, self, None, "runout")
+        bf.update_states()
     # Host moves
     def start_move(self, gcmd, cmd, args):
         bf = self.bf
@@ -270,6 +289,10 @@ class BufferChannel:
                 % (bf.name, self.name))
         bf.wake()
         self.enable_motor()
+        self.error = False
+        self.move_error = None
+        self._send_move(cmd, args)
+    def _send_move(self, cmd, args):
         tag = self.next_tag
         self.next_tag = tag % 255 + 1
         self.move_tag = tag
@@ -293,6 +316,8 @@ class BufferChannel:
                     " aborted" % (bf.name, self.name, timeout))
             bf.reactor.pause(now + .02)
         reason = self.move_result
+        if waited and self.move_error:
+            raise bf.error(gcmd, self.move_error)
         if waited and reason in (REASON_ABORTED, REASON_BUSY,
                                  REASON_LOAD_TIMEOUT):
             raise bf.error(gcmd, "buffer_feed '%s' %s: move ended with '%s'"
@@ -300,12 +325,81 @@ class BufferChannel:
     def abort(self):
         self.abort_cmd.send([self.oid])
         self.move_pending = False
+        if self.unload_stage:
+            self._unload_finish("aborted")
+    # Unload sequence: back until the exit sensor releases, then back until
+    # the entry sensor releases.  Runs without blocking G-Code.
+    def start_unload(self, gcmd, exit_distance, entry_distance):
+        bf = self.bf
+        if self.move_pending:
+            raise bf.error(gcmd,
+                "buffer_feed '%s' %s: the previous move is still running"
+                % (bf.name, self.name))
+        bf.wake()
+        self.enable_motor()
+        self.error = False
+        self.move_error = None
+        # Feeding and loading off, otherwise the buffer feeds again
+        self.unload_restore_load = self.load
+        self.feed = self.load = False
+        self.send_mask()
+        self.unload_args = (exit_distance, entry_distance)
+        stage = 1 if bf.sensors.get('exit_' + self.name) else 2
+        self._unload_move(stage)
+    def _unload_move(self, stage):
+        bf = self.bf
+        self.unload_stage = stage
+        distance = self.unload_args[stage - 1]
+        sel = STOP_SENSORS['EXIT' if stage == 1 else 'ENTRY']
+        steps, start, cruise, add, dadd, feed_dir = self.calc_profile(
+            distance, bf.velocity, bf.accel, bf.decel, bf.start_velocity)
+        self._send_move(self.start_cmd, [self.oid, steps, start, cruise, add,
+                                         dadd, sel, 0, 1])
+    def _unload_next(self, reason):
+        # The MCU finished a stage of the unload sequence
+        if reason == REASON_STOP and self.unload_stage == 1:
+            self._unload_move(2)
+        elif reason == REASON_STOP:
+            self._unload_finish(None)
+        elif reason == REASON_DONE:
+            self._unload_finish("the %s sensor did not release within %.0f mm"
+                                % ('exit' if self.unload_stage == 1
+                                   else 'entry',
+                                   self.unload_args[self.unload_stage - 1]))
+        else:
+            self._unload_finish(REASON_NAMES.get(reason, str(reason)))
+    def _unload_finish(self, error):
+        bf = self.bf
+        self.unload_stage = 0
+        self.load = self.unload_restore_load
+        if not bf.sleeping:
+            self.send_mask()
+        if error is not None:
+            self.move_error = ("buffer_feed '%s' %s: unload stopped: %s"
+                               % (bf.name, self.name, error))
+            if error != "aborted":
+                bf.gcode.respond_raw("!! " + self.move_error)
+        bf.update_states()
+    def get_state(self):
+        # Simple state for status LEDs: empty, preloaded, loaded or error
+        bf = self.bf
+        if self.error:
+            return 'error'
+        if self.entry is None:
+            return 'loaded' if self.feed else 'empty'
+        if not bf.sensors.get('entry_' + self.name):
+            return 'empty'
+        if bf.sensors.get('exit_' + self.name) or self.feed:
+            return 'loaded'
+        return 'preloaded'
     def get_status(self):
         bf = self.bf
         return {'entry': bf.sensors.get('entry_' + self.name, False),
                 'exit': bf.sensors.get('exit_' + self.name, False),
                 'feed': self.feed, 'auto_load': self.load,
                 'runout': self.runout,
+                'state': self.get_state(),
+                'unloading': bool(self.unload_stage),
                 'last_result': REASON_NAMES.get(self.last_reason, 'unknown'),
                 'last_steps': self.last_steps,
                 'fault_count': self.fault_count,
@@ -358,6 +452,12 @@ class BufferFeed:
         self.exit_samples = config.getint('exit_samples', 2,
                                           minval=1, maxval=255)
         self.max_runs = config.getint('max_runs', 3, minval=0, maxval=255)
+        self.retract_max_runs = config.getint('retract_max_runs', 10,
+                                              minval=0, maxval=255)
+        self.unload_exit_distance = config.getfloat('unload_exit_distance',
+                                                    2000., above=0.)
+        self.unload_entry_distance = config.getfloat('unload_entry_distance',
+                                                     600., above=0.)
         self.start_enabled = config.getboolean('enable', True)
         self.enable_stepper = config.getboolean('enable_stepper', True)
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -368,6 +468,8 @@ class BufferFeed:
             config, 'runout_gcode', '')
         self.gate_release_gcode = gcode_macro.load_template(
             config, 'gate_release_gcode', '')
+        self.state_gcode = gcode_macro.load_template(
+            config, 'state_gcode', '')
         # Channels
         self.channels = []
         for cname in CHANNELS:
@@ -441,6 +543,8 @@ class BufferFeed:
                 ("BUFFER_FEED_LOAD", self.cmd_BUFFER_FEED_LOAD,
                  "Start the load sequence of a channel (entry to exit"
                  " sensor)"),
+                ("BUFFER_FEED_UNLOAD", self.cmd_BUFFER_FEED_UNLOAD,
+                 "Unload a channel until the entry sensor releases"),
                 ("BUFFER_FEED_WAIT", self.cmd_BUFFER_FEED_WAIT,
                  "Wait until running buffer feed moves have finished"),
                 ("BUFFER_FEED_ABORT", self.cmd_BUFFER_FEED_ABORT,
@@ -517,10 +621,24 @@ class BufferFeed:
                                    % (self.name, ch.name, msg))
         self.reactor.register_callback(
             (lambda e: self._run_template(template, ch, reason)))
-    def _run_template(self, template, ch, reason):
+    def update_states(self):
+        # Run state_gcode for every channel whose state changed
+        if not self.ready or self.mcu.is_fileoutput():
+            return
+        for ch in self.channels:
+            state = ch.get_state()
+            if state == ch.reported_state:
+                continue
+            ch.reported_state = state
+            self.reactor.register_callback(
+                (lambda e, c=ch, s=state: self._run_template(
+                    self.state_gcode, c, "state", {'STATE': s})))
+    def _run_template(self, template, ch, reason, extra=None):
         context = template.create_template_context()
         context['params'] = {'BUFFER': self.name, 'REASON': reason,
                              'CHANNEL': ch.name if ch is not None else ''}
+        if extra:
+            context['params'].update(extra)
         try:
             script = template.render(context)
             if script:
@@ -536,10 +654,13 @@ class BufferFeed:
         p = self._params()
         for ch in self.channels:
             ch.send_profiles(p)
+        # Wait for the sensor states before selecting the channel
+        waketime = self.reactor.monotonic() + STARTUP_DELAY
         if self.start_enabled:
-            # Wait for the sensor states before selecting the channel
-            self.reactor.register_callback(
-                self._startup_enable, self.reactor.monotonic() + STARTUP_DELAY)
+            self.reactor.register_callback(self._startup_enable, waketime)
+        self.reactor.register_callback(self._startup_states, waketime)
+    def _startup_states(self, eventtime):
+        self.update_states()
     def _startup_enable(self, eventtime):
         try:
             self.gcode.run_script("SET_BUFFER_FEED BUFFER=%s ENABLE=1"
@@ -600,6 +721,11 @@ class BufferFeed:
         elif name == 'gate' and not state:
             self._run_template(self.gate_release_gcode, self.get_active(),
                                "gate_release")
+        if name.startswith('entry_') or name.startswith('exit_'):
+            ch = self._lookup_channel(name.split('_', 1)[1])
+            if name.startswith('entry_'):
+                ch.error = False    # filament inserted or removed
+            self.update_states()
     def _auto_select(self):
         # Channel that feeds after ENABLE=1: the only one, or the one that
         # is loaded through to the buffer (exit sensor active)
@@ -707,6 +833,7 @@ class BufferFeed:
             return
         if self.sleeping:
             self.wake()
+            self.update_states()
             return
         for c in self.channels:
             mask = c.get_mask()
@@ -714,6 +841,7 @@ class BufferFeed:
                 c.enable_motor()
             if mask != old[c]:
                 c.send_mask(mask)
+        self.update_states()
     def _lookup_stop_sensor(self, gcmd, ch, name):
         # Returns the mcu selector for a sensor name used by STOP=
         sel = STOP_SENSORS.get(name.strip().upper())
@@ -773,6 +901,25 @@ class BufferFeed:
         ch.start_move(gcmd, ch.load_cmd, [ch.oid])
         if wait:
             ch.wait_done(gcmd, timeout)
+    def cmd_BUFFER_FEED_UNLOAD(self, gcmd):
+        ch = self._get_channel(gcmd)
+        if ch.entry is None:
+            raise gcmd.error("buffer_feed '%s' channel %s has no"
+                             " entry/exit pins" % (self.name, ch.name))
+        exit_distance = gcmd.get_float('EXIT_DISTANCE',
+                                       self.unload_exit_distance, above=0.)
+        entry_distance = gcmd.get_float('ENTRY_DISTANCE',
+                                        self.unload_entry_distance, above=0.)
+        wait = gcmd.get_int('WAIT', 0, minval=0, maxval=1)
+        timeout = gcmd.get_float(
+            'WAIT_TIMEOUT', 2. * (exit_distance + entry_distance)
+            / self.velocity + 6., above=0.)
+        if self.mcu.is_fileoutput():
+            return
+        ch.start_unload(gcmd, exit_distance, entry_distance)
+        self.update_states()
+        if wait:
+            ch.wait_done(gcmd, timeout)
     def cmd_BUFFER_FEED_WAIT(self, gcmd):
         timeout = gcmd.get_float('TIMEOUT', 60., above=0.)
         if gcmd.get('CHANNEL', None) is not None:
@@ -790,6 +937,7 @@ class BufferFeed:
             return
         for ch in channels:
             ch.abort()
+        self.update_states()
     def cmd_QUERY_BUFFER_FEED(self, gcmd):
         if self.mcu.is_fileoutput():
             return
@@ -834,7 +982,8 @@ class BufferFeed:
                 'last_result': REASON_NAMES.get(self.last_reason, 'unknown'),
                 'distance': self.distance, 'velocity': self.velocity,
                 'accel': self.accel, 'decel': self.decel,
-                'retract_distance': self.retract_distance}
+                'retract_distance': self.retract_distance,
+                'retract_max_runs': self.retract_max_runs}
 
 def load_config_prefix(config):
     return BufferFeed(config)

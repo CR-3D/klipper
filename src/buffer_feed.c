@@ -11,8 +11,12 @@
 //  * "Loading": an entry sensor starts the stepper, which runs until the exit
 //    sensor triggers (or a timeout expires).  After the exit sensor
 //    triggered the stepper moves a configured distance and stops.
-//  * "Runout": if feeding has no effect and the entry sensor reports no
-//    filament, feeding pauses (no fault) until filament is inserted again.
+//  * "Runout": when the entry sensor releases while feeding is enabled and
+//    the exit sensor still detects filament, a runout is reported at once.
+//    Feeding then reacts to edges of the trigger sensor only: one run per
+//    trigger, no run limit and no fault.  Once the end of the filament has
+//    left the feeder a run no longer releases the trigger and feeding stops.
+//    This lasts until filament is inserted again.
 //
 // Feeding (and retract) and loading are enabled separately by the host.
 //
@@ -39,7 +43,7 @@ enum {
     BF_ABORT = 1<<6, BF_HAVE_GATE = 1<<7, BF_HAVE_LOAD = 1<<8,
     BF_NEED_ENTRY_RELEASE = 1<<9, BF_STOPPING = 1<<10,
     BF_REVERSE_AFTER = 1<<11, BF_LOAD_ON = 1<<12, BF_RUNOUT = 1<<13,
-    BF_RETRACT = 1<<14,
+    BF_RETRACT = 1<<14, BF_ENTRY_SEEN = 1<<15,
 };
 
 // Bits of the enable mask sent by the host
@@ -79,9 +83,9 @@ struct buffer_feed {
     struct stepper *stepper;
     struct bf_sensor trig, stop, gate, entry, exit;
     uint32_t poll_ticks;
-    uint16_t flags;
+    uint32_t flags;
     uint8_t state, reason, tag, rtag, max_runs, runs, rruns, kind, stage;
-    uint8_t clear_back;
+    uint8_t clear_back, retract_max_runs, entry_rel;
     // Sensor that ends the active feed move
     struct bf_sensor *sel_sensor;
     uint8_t sel_level, sel_samples, sel_cnt;
@@ -308,7 +312,7 @@ static uint_fast8_t
 buffer_feed_poll_event(struct timer *t)
 {
     struct buffer_feed *b = container_of(t, struct buffer_feed, time);
-    uint16_t flags = b->flags;
+    uint32_t flags = b->flags;
     if (!(flags & (BF_ENABLED | BF_LOAD_ON)) || b->state == BS_FAULT) {
         b->flags &= ~BF_TIMER;
         return SF_DONE;
@@ -318,10 +322,27 @@ buffer_feed_poll_event(struct timer *t)
         if (!bf_active(&b->entry)) {
             b->entry.cnt = 0;
             b->flags &= ~BF_NEED_ENTRY_RELEASE;
+            if ((flags & (BF_ENABLED | BF_ENTRY_SEEN | BF_RUNOUT))
+                == (BF_ENABLED | BF_ENTRY_SEEN)
+                && ++b->entry_rel >= b->entry.samples) {
+                b->flags &= ~BF_ENTRY_SEEN;
+                if (bf_active(&b->exit)) {
+                    // Filament end passed the entry sensor of a channel that
+                    // is loaded through - runout (not a removed filament)
+                    b->flags |= BF_RUNOUT | BF_REPORT;
+                    b->reason = BR_RUNOUT;
+                    b->rtag = 0;
+                    b->done = 0;
+                    b->runs = 0;
+                    sched_wake_task(&buffer_feed_wake);
+                }
+            }
         } else {
+            b->entry_rel = 0;
+            b->flags |= BF_ENTRY_SEEN;
             if (flags & BF_RUNOUT) {
                 // New filament - feeding may resume
-                b->flags &= ~BF_RUNOUT;
+                b->flags &= ~(BF_RUNOUT | BF_NEED_RELEASE);
                 b->runs = b->rruns = 0;
             }
             if ((flags & BF_LOAD_ON) && !(flags & BF_NEED_ENTRY_RELEASE)
@@ -344,14 +365,16 @@ buffer_feed_poll_event(struct timer *t)
         }
     }
     flags = b->flags;
-    if ((flags & BF_ENABLED) && !(flags & BF_RUNOUT)) {
+    if (flags & BF_ENABLED) {
         // Retract: stop sensor (buffer pushed beyond full)
-        if ((flags & BF_HAVE_STOP) && b->retract_steps) {
+        if ((flags & BF_HAVE_STOP) && b->retract_steps
+            && !(flags & BF_RUNOUT)) {
             if (!bf_active(&b->stop)) {
                 b->stop.cnt = 0;
                 b->rruns = 0;
             } else if (bf_sensor_hit(&b->stop)) {
-                if (b->max_runs && b->rruns >= b->max_runs)
+                if (b->retract_max_runs
+                    && b->rruns >= b->retract_max_runs)
                     // Still beyond full after all permitted retracts
                     return bf_poll_fault(b, BR_RETRACT_FAULT);
                 b->rruns++;
@@ -372,11 +395,18 @@ buffer_feed_poll_event(struct timer *t)
             b->trig.cnt = 0;
         } else if (!(flags & BF_NEED_RELEASE) && b->feed_p.steps
                    && bf_sensor_hit(&b->trig)) {
+            if (flags & BF_RUNOUT) {
+                // Runout: one run per trigger edge, no limit, no fault
+                bf_start_run(b, &b->feed_p, b->feed_p.steps, RK_FEED, SEL_STOP
+                             , 1);
+                b->flags |= BF_AUTO | BF_NEED_RELEASE;
+                return SF_RESCHEDULE;
+            }
             if (b->max_runs && b->runs >= b->max_runs) {
                 // Trigger still active after all permitted runs
                 if ((flags & BF_HAVE_LOAD) && !bf_active(&b->entry)) {
                     // No filament at the entry sensor - runout, no fault
-                    b->flags |= BF_RUNOUT | BF_REPORT;
+                    b->flags |= BF_RUNOUT | BF_REPORT | BF_NEED_RELEASE;
                     b->reason = BR_RUNOUT;
                     b->rtag = 0;
                     b->done = 0;
@@ -402,7 +432,7 @@ static uint_fast8_t
 buffer_feed_step_event(struct timer *t)
 {
     struct buffer_feed *b = container_of(t, struct buffer_feed, time);
-    uint16_t flags = b->flags;
+    uint32_t flags = b->flags;
     if (flags & BF_ABORT)
         return bf_finish(b, BR_ABORT);
     uint8_t seeking = b->kind == RK_LOAD && b->stage == ST_SEEK;
@@ -481,11 +511,12 @@ command_config_buffer_feed_stop(uint32_t *args)
 {
     struct buffer_feed *b = oid_lookup(args[0], command_config_buffer_feed);
     bf_sensor_setup(&b->stop, args[1], args[2], args[3], args[4]);
+    b->retract_max_runs = args[5];
     b->flags |= BF_HAVE_STOP;
 }
 DECL_COMMAND(command_config_buffer_feed_stop,
              "config_buffer_feed_stop oid=%c stop_pin=%c stop_pull_up=%c"
-             " stop_active=%c stop_samples=%c");
+             " stop_active=%c stop_samples=%c retract_max_runs=%c");
 
 void
 command_config_buffer_feed_gate(uint32_t *args)
@@ -552,7 +583,7 @@ command_buffer_feed_enable(uint32_t *args)
     struct buffer_feed *b = oid_lookup(args[0], command_config_buffer_feed);
     uint8_t mask = args[1];
     irq_disable();
-    uint16_t flags = b->flags & ~(BF_ENABLED | BF_LOAD_ON);
+    uint32_t flags = b->flags & ~(BF_ENABLED | BF_LOAD_ON);
     if (mask & BE_FEED)
         flags |= BF_ENABLED;
     if (mask & BE_LOAD)
@@ -570,10 +601,11 @@ command_buffer_feed_enable(uint32_t *args)
         if (b->state == BS_FAULT)
             b->state = BS_IDLE;
         b->runs = b->rruns = b->trig.cnt = b->stop.cnt = b->entry.cnt = 0;
-        b->flags &= ~BF_RUNOUT;
+        b->flags &= ~(BF_RUNOUT | BF_ENTRY_SEEN);
+        b->entry_rel = 0;
         // Filament that is already at sensor 1 does not start a load
         if ((b->flags & BF_HAVE_LOAD) && bf_active(&b->entry))
-            b->flags |= BF_NEED_ENTRY_RELEASE;
+            b->flags |= BF_NEED_ENTRY_RELEASE | BF_ENTRY_SEEN;
         if (!(b->flags & BF_TIMER)) {
             b->flags |= BF_TIMER;
             b->time.func = buffer_feed_poll_event;
@@ -688,7 +720,7 @@ command_buffer_feed_query(uint32_t *args)
     struct buffer_feed *b = oid_lookup(oid, command_config_buffer_feed);
     irq_disable();
     uint8_t state = b->state, reason = b->reason, runs = b->runs;
-    uint16_t flags = b->flags;
+    uint32_t flags = b->flags;
     uint32_t done = b->done, total = b->total, remaining = b->remaining;
     irq_enable();
     uint8_t trig = bf_active(&b->trig);

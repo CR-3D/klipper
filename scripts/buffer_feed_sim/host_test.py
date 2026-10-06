@@ -165,6 +165,7 @@ opts = {
     'runout_gcode': 'M118 runout {params.CHANNEL}',
     'gate_release_gcode': '_GATE_RELEASED CH={params.CHANNEL}',
     'fault_gcode': 'M118 fault {params.CHANNEL} {params.REASON}',
+    'state_gcode': '_LED CH={params.CHANNEL} STATE={params.STATE}',
 }
 printer = Printer()
 bf = bfm.BufferFeed(Config(printer, opts))
@@ -201,6 +202,8 @@ check(any('entry_pin=T1SW0' in c and 'exit_pin=T1SW1' in c
           for c in MCU0.cfg), "channel t1 entry/exit")
 check(any('poll_ticks=320000' in c and 'trigger_debounce=2' in c
           for c in MCU0.cfg), "5 ms poll, 10 ms debounce = 2 polls")
+check(any('retract_max_runs=10' in c for c in MCU0.cfg),
+      "retract_max_runs default 10")
 
 print("== startup: t0 is loaded through (exit active)")
 press('^station:T0SW1', 1); press('^station:T0SW0', 1)
@@ -215,6 +218,9 @@ st = bf.get_status(0)
 check(st['active_channel'] == 't0', "active_channel t0")
 check(st['channels']['t1']['entry'] and not st['channels']['t1']['exit'],
       "t1 sensor states in status")
+check('_LED CH=t0 STATE=loaded' in gcode.scripts
+      and '_LED CH=t1 STATE=preloaded' in gcode.scripts,
+      "state_gcode: t0 loaded, t1 preloaded")
 
 print("== FEED=1 on t1 is refused while t0 is loaded through")
 err = run("SET_BUFFER_FEED BUFFER=station CHANNEL=t1 FEED=1")
@@ -275,6 +281,51 @@ check(any('buffer_high still active' in r for r in gcode.raw),
       "retract fault message")
 check(any(s.startswith('M118 fault t1 retract_fault') for s in gcode.scripts),
       "fault_gcode with CHANNEL and REASON")
+
+print("== unload sequence (non blocking) and abort")
+check(bf.get_status(0)['channels']['t1']['state'] == 'error',
+      "t1 state error after the fault")
+check('_LED CH=t1 STATE=error' in gcode.scripts, "state_gcode error")
+press('^station:T1SW1', 1)
+check(run("SET_BUFFER_FEED BUFFER=station CHANNEL=t1 AUTO_LOAD=1") is None,
+      "t1 auto load on")
+n0 = len(log)
+check(run("BUFFER_FEED_UNLOAD BUFFER=station CHANNEL=t1") is None,
+      "BUFFER_FEED_UNLOAD returns at once")
+mv = [a for n, a in log[n0:] if n == 'buffer_feed_start']
+check(masks()[1] == 0 and len(mv) == 1 and mv[0][6] == 4 and mv[0][7] == 0
+      and mv[0][8] == 1, "feeding/loading off, back until exit releases")
+check(bf.get_status(0)['channels']['t1']['unloading'], "unloading in status")
+event(1, 2, tag=mv[0][9])
+mv2 = [a for n, a in log[n0:] if n == 'buffer_feed_start']
+check(len(mv2) == 2 and mv2[1][6] == 3 and mv2[1][9] != mv[0][9],
+      "second stage: back until entry releases")
+check(bf.channels[1].move_pending, "still pending between the stages")
+press('^station:T1SW1', 0); press('^station:T1SW0', 0)
+event(1, 2, tag=mv2[1][9])
+check(not bf.channels[1].unload_stage and masks()[1] == 2,
+      "unload done, auto load restored (%s)" % masks())
+check(bf.get_status(0)['channels']['t1']['state'] == 'empty',
+      "t1 state empty")
+check('_LED CH=t1 STATE=empty' in gcode.scripts, "state_gcode empty")
+press('^station:T1SW0', 1)
+press('^station:T1SW1', 1)
+check(run("BUFFER_FEED_UNLOAD BUFFER=station CHANNEL=t1") is None,
+      "second unload started")
+check(run("BUFFER_FEED_ABORT BUFFER=station CHANNEL=t1") is None, "abort")
+check(not bf.channels[1].unload_stage and masks()[1] == 2,
+      "aborted: no second stage, auto load restored")
+mv3 = [a for n, a in log if n == 'buffer_feed_start'][-1]
+event(1, 3, tag=mv3[9])
+check(not bf.channels[1].move_pending and not bf.channels[1].unload_stage,
+      "late abort event ignored")
+n0 = len(log)
+check(run("BUFFER_FEED_UNLOAD BUFFER=station CHANNEL=t1") is None,
+      "third unload started")
+mv4 = [a for n, a in log[n0:] if n == 'buffer_feed_start'][0]
+event(1, 1, tag=mv4[9])
+check(any('exit sensor did not release within 2000 mm' in r
+          for r in gcode.raw), "stage ran out of distance: error shown")
 
 print("== commands need CHANNEL with two channels")
 err = run("BUFFER_FEED_LOAD BUFFER=station")
