@@ -29,6 +29,7 @@ int stepcompress_append(struct stepcompress *sc, int sdir
 int stepcompress_commit(struct stepcompress *sc);
 int stepcompress_flush(struct stepcompress *sc, uint64_t move_clock);
 int stepcompress_reset(struct stepcompress *sc, uint64_t last_step_clock);
+void stepcompress_discard(struct stepcompress *sc);
 int stepcompress_set_last_position(struct stepcompress *sc, uint64_t clock
                                    , int64_t last_position);
 int64_t stepcompress_find_past_position(struct stepcompress *sc

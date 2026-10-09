@@ -55,6 +55,17 @@ class ClockSync:
         if pace:
             freq = self.mcu_freq
         serial.set_clock_est(freq, self.reactor.monotonic(), 0, 0)
+    def disconnect(self):
+        # Stop clock queries and reset the clock regression state
+        self.reactor.update_timer(self.get_clock_timer, self.reactor.NEVER)
+        self.queries_pending = 0
+        self.last_clock = 0
+        self.min_half_rtt = 999999999.9
+        self.min_rtt_time = 0.
+        self.time_avg = self.time_variance = 0.
+        self.clock_avg = self.clock_covariance = 0.
+        self.prediction_variance = 0.
+        self.last_prediction_time = 0.
     # MCU clock querying (_handle_clock is invoked from background thread)
     def _get_clock_event(self, eventtime):
         self.serial.raw_send(self.get_clock_cmd, 0, 0, self.cmd_queue)
@@ -166,7 +177,10 @@ class SecondarySync(ClockSync):
         self.main_sync = main_sync
         self.clock_adj = (0., 1.)
         self.last_sync_time = 0.
+        self.is_offline = False
     def connect(self, serial):
+        self.is_offline = False
+        self.last_sync_time = 0.
         ClockSync.connect(self, serial)
         self.clock_adj = (0., self.mcu_freq)
         curtime = self.reactor.monotonic()
@@ -176,6 +190,17 @@ class SecondarySync(ClockSync):
         self.calibrate_clock(0., curtime)
     def connect_file(self, serial, pace=False):
         ClockSync.connect_file(self, serial, pace)
+        self.clock_adj = (0., self.mcu_freq)
+    def connect_offline(self, serial):
+        # Disconnected non-critical mcu - follow the clock of the main mcu
+        # so that print_time conversions stay valid
+        ClockSync.connect_file(self, serial)
+        self.is_offline = True
+        self._sync_offline(self.reactor.monotonic())
+    def _sync_offline(self, eventtime):
+        ser_time, ser_clock, ser_freq = self.main_sync.clock_est
+        scale = self.mcu_freq / self.main_sync.mcu_freq
+        self.clock_est = (ser_time, ser_clock * scale, ser_freq * scale)
         self.clock_adj = (0., self.mcu_freq)
     # clock frequency conversions
     def print_time_to_clock(self, print_time):
@@ -193,6 +218,9 @@ class SecondarySync(ClockSync):
         adjusted_offset, adjusted_freq = self.clock_adj
         return "%s adj=%d" % (ClockSync.stats(self, eventtime), adjusted_freq)
     def calibrate_clock(self, print_time, eventtime):
+        if self.is_offline:
+            self._sync_offline(eventtime)
+            return self.clock_adj
         # Calculate: est_print_time = main_sync.estimatated_print_time()
         ser_time, ser_clock, ser_freq = self.main_sync.clock_est
         main_mcu_freq = self.main_sync.mcu_freq

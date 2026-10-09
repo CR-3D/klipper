@@ -270,6 +270,25 @@ steppersync_set_time(struct steppersync *ss, double time_offset
     }
 }
 
+// Discard all pending steps and messages - used when the clock of the
+// mcu changes (reconnect of a non-critical mcu)
+void __visible
+steppersync_discard(struct steppersync *ss)
+{
+    struct syncemitter *se;
+    list_for_each_entry(se, &ss->se_list, ss_node) {
+        if (se->sc)
+            stepcompress_discard(se->sc);
+        while (!list_empty(&se->msg_queue)) {
+            struct queue_message *qm = list_first_entry(
+                &se->msg_queue, struct queue_message, node);
+            list_del(&qm->node);
+            message_free(qm);
+        }
+    }
+    memset(ss->move_clocks, 0, sizeof(*ss->move_clocks)*ss->num_move_clocks);
+}
+
 // Implement a binary heap algorithm to track when the next available
 // 'struct move' in the mcu will be available
 static void

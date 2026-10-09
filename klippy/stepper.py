@@ -56,6 +56,18 @@ class MCU_stepper:
         self._trapq = ffi_main.NULL
         printer.register_event_handler('klippy:connect',
                                        self._query_mcu_position)
+        printer.register_event_handler('mcu:reconnected',
+                                       self._handle_mcu_reconnected)
+    def _handle_mcu_reconnected(self, mcu):
+        # Non-critical mcu reconnected (its pending steps were discarded
+        # by motion_queuing.reset_mcu_clock()) - resync the position
+        if mcu is not self._mcu:
+            return
+        try:
+            self._query_mcu_position()
+        except Exception:
+            logging.exception("Unable to resync stepper '%s' position",
+                              self._name)
     def get_mcu(self):
         return self._mcu
     def get_name(self, short=False):

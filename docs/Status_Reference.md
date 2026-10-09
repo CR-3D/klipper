@@ -265,6 +265,21 @@ The following information is available for heater objects such as
   1.0) associated with the heater.
 - `can_extrude`: If extruder can extrude (defined by `min_extrude_temp`),
   available only for [extruder](Config_Reference.md#extruder)
+- `fault`: The reason of a heater fault or None (only available with
+  a [heater_faults](Config_Reference.md#heater_faults) section).
+- `disabled`: True if the heater is disabled (only available with a
+  [heater_faults](Config_Reference.md#heater_faults) section).
+
+## heater_faults
+
+The following information is available in the `heater_faults` object
+(this object is available if any heater is defined):
+- `enabled`: True if a [heater_faults](Config_Reference.md#heater_faults)
+  section is configured.
+- `faults`: A dictionary of the heaters and temperature sensors with a
+  fault (full config section name) and the fault reason.
+- `disabled`: A list of the disabled heaters and temperature sensors
+  (full config section names).
 
 ## heaters
 
@@ -357,6 +372,11 @@ The following information is available in
   micro-controller architectures and with each code revision.
 - `last_stats.<statistics_name>`: Statistics information on the
   micro-controller connection.
+- `non_critical_disconnected`: True if a non-critical micro-controller
+  is currently disconnected (only available if `is_non_critical` is
+  set).
+- `disconnect_reason`: The reason why a non-critical micro-controller
+  is disconnected or None.
 
 ## motion_report
 

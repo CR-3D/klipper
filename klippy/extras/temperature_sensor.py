@@ -16,13 +16,18 @@ class PrinterSensorGeneric:
                                         minval=KELVIN_TO_CELSIUS)
         self.max_temp = config.getfloat('max_temp', 99999999.9,
                                         above=self.min_temp)
-        self.sensor.setup_minmax(self.min_temp, self.max_temp)
+        # Allows the sensor to be disabled (see heater_faults.py)
+        self.heater_faults = self.printer.load_object(config, 'heater_faults')
+        self.sensor_check = self.heater_faults.setup_sensor(
+            config.get_name(), self.sensor, self.min_temp, self.max_temp)
         self.sensor.setup_callback(self.temperature_callback)
         pheaters.register_sensor(config, self)
         self.last_temp = 0.
         self.measured_min = 99999999.
         self.measured_max = 0.
     def temperature_callback(self, read_time, temp):
+        if self.sensor_check is not None:
+            self.heater_faults.check_sensor(self.sensor_check, temp)
         self.last_temp = temp
         if temp:
             self.measured_min = min(self.measured_min, temp)

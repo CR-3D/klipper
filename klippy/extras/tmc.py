@@ -176,6 +176,9 @@ class TMCErrorCheck:
             self.adc_temp = None
             return
     def _do_periodic_check(self, eventtime):
+        if self.mcu_tmc.get_mcu().is_offline():
+            # Disconnected non-critical mcu
+            return eventtime + 1.
         try:
             self._query_register(self.drv_status_reg_info)
             if self.gstat_reg_info is not None:
@@ -346,6 +349,8 @@ class TMCCommandHelper:
                                             self._handle_mcu_identify)
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
+        self.printer.register_event_handler("mcu:reconnected",
+                                            self._handle_mcu_reconnected)
         # Register commands
         gcode = self.printer.lookup_object("gcode")
         gcode.register_mux_command("SET_TMC_FIELD", "STEPPER", self.name,
@@ -476,6 +481,9 @@ class TMCCommandHelper:
                     else:
                         self._do_disable(print_time)
             except self.printer.command_error as e:
+                if self.mcu_tmc.get_mcu().is_offline():
+                    logging.info("TMC %s: %s", self.name, str(e))
+                    return
                 self.printer.invoke_shutdown(str(e))
         self.printer.get_reactor().register_callback(enable_disable_cb)
     # Initial startup handling
@@ -499,6 +507,15 @@ class TMCCommandHelper:
             logging.info("Enabling TMC virtual enable for '%s'",
                          self.stepper_name)
         # Send init
+        try:
+            self._init_registers()
+        except self.printer.command_error as e:
+            logging.info("TMC %s failed to init: %s", self.name, str(e))
+    def _handle_mcu_reconnected(self, mcu):
+        # The driver of a reconnected non-critical mcu lost its settings
+        if mcu is not self.mcu_tmc.get_mcu():
+            return
+        self.mcu_phase_offset = None
         try:
             self._init_registers()
         except self.printer.command_error as e:

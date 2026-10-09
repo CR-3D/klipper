@@ -7,6 +7,9 @@ import logging
 from . import bus
 
 REPORT_TIME = .8
+# Retry interval and reported value after a communication error
+ERROR_RETRY_TIME = 5.
+ERROR_VALUE = 9999.
 BME280_CHIP_ADDR = 0x76
 
 BME280_REGS = {
@@ -133,6 +136,9 @@ class BME280:
         self.reactor = self.printer.get_reactor()
         self.i2c = bus.MCU_I2C_from_config(
             config, default_addr=BME280_CHIP_ADDR, default_speed=100000)
+        # The readings are informative only - an I2C error must not
+        # shut down the printer
+        self.i2c.set_raise_errors()
         self.mcu = self.i2c.get_mcu()
         self.iir_filter = config.getint('bme280_iir_filter', 1)
         self.os_temp = config.getint('bme280_oversample_temp', 2)
@@ -149,7 +155,8 @@ class BME280:
         self.temp = self.pressure = self.humidity = self.gas = self.t_fine = 0.
         self.min_temp = self.max_temp = self.range_switching_error = 0.
         self.max_sample_time = None
-        self.dig = self.sample_timer = None
+        self.dig = self.sample_timer = self.sample_func = None
+        self.error = None
         self.chip_type = 'BMP280'
         self.chip_registers = BME280_REGS
         self.printer.add_object("bme280 " + self.name, self)
@@ -160,8 +167,41 @@ class BME280:
         self.last_gas_time = 0
 
     def handle_connect(self):
-        self._init_bmxx80()
+        # The sensor is initialized from the sample timer so that a
+        # missing or faulty sensor does not prevent the printer startup
+        self.sample_timer = self.reactor.register_timer(self._sample)
         self.reactor.update_timer(self.sample_timer, self.reactor.NOW)
+
+    def _sample(self, eventtime):
+        try:
+            if self.sample_func is None:
+                self._init_bmxx80()
+            next_time = self.sample_func(eventtime)
+        except Exception as e:
+            return self._handle_error(e)
+        if self.error is not None:
+            self.error = None
+            msg = "%s '%s': communication restored" % (
+                self.chip_type, self.name)
+            logging.info(msg)
+            self.printer.lookup_object('gcode').respond_info(msg)
+        return next_time
+
+    def _handle_error(self, e):
+        if self.error is None:
+            logging.exception("%s '%s': error reading sensor",
+                              self.chip_type, self.name)
+            self.printer.lookup_object('gcode').respond_raw(
+                "!! %s '%s': %s (reporting %.0f, retrying every %.0fs)"
+                % (self.chip_type, self.name, e, ERROR_VALUE,
+                   ERROR_RETRY_TIME))
+        self.error = str(e)
+        # Re-initialize the chip, it may have been reset
+        self.sample_func = None
+        self.temp = self.pressure = self.humidity = self.gas = ERROR_VALUE
+        measured_time = self.reactor.monotonic()
+        self._callback(self.mcu.estimated_print_time(measured_time), self.temp)
+        return measured_time + ERROR_RETRY_TIME
 
     def setup_minmax(self, min_temp, max_temp):
         self.min_temp = min_temp
@@ -299,10 +339,10 @@ class BME280:
             self.max_sample_time = \
                     (1.25 + (2.3 * self.os_temp) + ((2.3 * self.os_pres) + .575)
                      + ((2.3 * self.os_hum) + .575)) / 1000
-            self.sample_timer = self.reactor.register_timer(self._sample_bme680)
+            self.sample_func = self._sample_bme680
             self.chip_registers = BME680_REGS
         elif self.chip_type == 'BMP180':
-            self.sample_timer = self.reactor.register_timer(self._sample_bmp180)
+            self.sample_func = self._sample_bmp180
             self.chip_registers = BMP180_REGS
         elif self.chip_type == 'BMP388':
             self.chip_registers = BMP388_REGS
@@ -320,18 +360,18 @@ class BME280:
             self.write_register("ORD", [BMP388_REG_VAL_ODR_50_HZ])
             self.write_register("INT_CTRL", [BMP388_REG_VAL_DRDY_EN])
 
-            self.sample_timer = self.reactor.register_timer(self._sample_bmp388)
+            self.sample_func = self._sample_bmp388
         elif self.chip_type == 'BME280':
             self.max_sample_time = \
                 (1.25 + (2.3 * self.os_temp) + ((2.3 * self.os_pres) + .575)
                  + ((2.3 * self.os_hum) + .575)) / 1000
-            self.sample_timer = self.reactor.register_timer(self._sample_bme280)
+            self.sample_func = self._sample_bme280
             self.chip_registers = BME280_REGS
         else:
             self.max_sample_time = \
                 (1.25 + (2.3 * self.os_temp)
                 + ((2.3 * self.os_pres) + .575)) / 1000
-            self.sample_timer = self.reactor.register_timer(self._sample_bme280)
+            self.sample_func = self._sample_bme280
             self.chip_registers = BME280_REGS
 
         # Read out and calculate the trimming parameters
@@ -410,16 +450,11 @@ class BME280:
     def _sample_bme280(self, eventtime):
         # In normal mode data shadowing is performed
         # So reading can be done while measurements are in process
-        try:
-            if self.chip_type == 'BME280':
-                data = self.read_register('PRESSURE_MSB', 8)
-            elif self.chip_type == 'BMP280':
-                data = self.read_register('PRESSURE_MSB', 6)
-            else:
-                return self.reactor.NEVER
-        except Exception:
-            logging.exception("BME280: Error reading data")
-            self.temp = self.pressure = self.humidity = .0
+        if self.chip_type == 'BME280':
+            data = self.read_register('PRESSURE_MSB', 8)
+        elif self.chip_type == 'BMP280':
+            data = self.read_register('PRESSURE_MSB', 6)
+        else:
             return self.reactor.NEVER
 
         temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
@@ -525,25 +560,20 @@ class BME280:
         if run_gas:
             max_sample_time += self.gas_heat_duration / 1000
         self.reactor.pause(self.reactor.monotonic() + max_sample_time)
-        try:
-            # wait until results are ready
+        # wait until results are ready
+        status = self.read_register('EAS_STATUS_0', 1)[0]
+        while status & MEASURE_IN_PROGRESS:
+            self.reactor.pause(
+                self.reactor.monotonic() + self.max_sample_time)
             status = self.read_register('EAS_STATUS_0', 1)[0]
-            while status & MEASURE_IN_PROGRESS:
-                self.reactor.pause(
-                    self.reactor.monotonic() + self.max_sample_time)
-                status = self.read_register('EAS_STATUS_0', 1)[0]
 
-            # Nothing in progress and no new data
-            if not status & EAS_NEW_DATA:
-                return self.reactor.monotonic() + REPORT_TIME
-            data = self.read_register('PRESSURE_MSB', 8)
-            gas_data = [0, 0]
-            if run_gas:
-                gas_data = self.read_register('GAS_R_MSB', 2)
-        except Exception:
-            logging.exception("BME680: Error reading data")
-            self.temp = self.pressure = self.humidity = self.gas = .0
-            return self.reactor.NEVER
+        # Nothing in progress and no new data
+        if not status & EAS_NEW_DATA:
+            return self.reactor.monotonic() + REPORT_TIME
+        data = self.read_register('PRESSURE_MSB', 8)
+        gas_data = [0, 0]
+        if run_gas:
+            gas_data = self.read_register('GAS_R_MSB', 2)
 
         temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
         if temp_raw != 0x80000:
@@ -580,27 +610,17 @@ class BME280:
         meas = self.chip_registers['CRV_TEMP']
         self.write_register('CTRL_MEAS', meas)
 
-        try:
-            self.reactor.pause(self.reactor.monotonic() + .01)
-            data = self.read_register('REG_MSB', 2)
-            temp_raw = (data[0] << 8) | data[1]
-        except Exception:
-            logging.exception("BMP180: Error reading temperature")
-            self.temp = self.pressure = .0
-            return self.reactor.NEVER
+        self.reactor.pause(self.reactor.monotonic() + .01)
+        data = self.read_register('REG_MSB', 2)
+        temp_raw = (data[0] << 8) | data[1]
 
         meas = self.chip_registers['CRV_PRES'] | (self.os_pres << 6)
         self.write_register('CTRL_MEAS', meas)
 
-        try:
-            self.reactor.pause(self.reactor.monotonic() + .01)
-            data = self.read_register('REG_MSB', 3)
-            pressure_raw = \
-                ((data[0] << 16)|(data[1] << 8)|data[2]) >> (8 - self.os_pres)
-        except Exception:
-            logging.exception("BMP180: Error reading pressure")
-            self.temp = self.pressure = .0
-            return self.reactor.NEVER
+        self.reactor.pause(self.reactor.monotonic() + .01)
+        data = self.read_register('REG_MSB', 3)
+        pressure_raw = \
+            ((data[0] << 16)|(data[1] << 8)|data[2]) >> (8 - self.os_pres)
 
         self.temp = self._compensate_temp_bmp180(temp_raw)
         self.pressure = self._compensate_pressure_bmp180(pressure_raw) / 100.
@@ -781,7 +801,8 @@ class BME280:
     def get_status(self, eventtime):
         data = {
             'temperature': round(self.temp, 2),
-            'pressure': self.pressure
+            'pressure': self.pressure,
+            'error': self.error
         }
         if self.chip_type in ('BME280', 'BME680'):
             data['humidity'] = self.humidity

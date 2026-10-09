@@ -77,6 +77,8 @@ class PrinterStepperEnable:
         self.enable_lines = {}
         self.printer.register_event_handler("gcode:request_restart",
                                             self._handle_request_restart)
+        self.printer.register_event_handler("mcu:reconnected",
+                                            self._handle_mcu_reconnected)
         # Register M18/M84 commands
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command("M18", self.cmd_M18)
@@ -124,6 +126,16 @@ class PrinterStepperEnable:
         return {'steppers': steppers}
     def _handle_request_restart(self, print_time):
         self.motor_off()
+    def _handle_mcu_reconnected(self, mcu):
+        # A reconnected non-critical mcu has all its motors disabled
+        lines = [el for el in self.enable_lines.values()
+                 if el.stepper.get_mcu() is mcu and el.is_motor_enabled()]
+        if not lines:
+            return
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        for el in lines:
+            el.motor_disable(print_time)
     def cmd_M18(self, gcmd):
         # Turn off motors
         self.motor_off()

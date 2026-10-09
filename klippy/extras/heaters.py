@@ -17,6 +17,7 @@ PID_PARAM_BASE = 255.
 MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
 MIN_PWM_CHANGE_RATIO = 0.05
+RANGE_CHECK_COUNT = 4
 
 class Heater:
     def __init__(self, config, sensor):
@@ -27,7 +28,13 @@ class Heater:
         self.sensor = sensor
         self.min_temp = config.getfloat('min_temp', minval=KELVIN_TO_CELSIUS)
         self.max_temp = config.getfloat('max_temp', above=self.min_temp)
-        self.sensor.setup_minmax(self.min_temp, self.max_temp)
+        # Fault handling (see heater_faults.py)
+        self.fault = None
+        self.range_errors = 0
+        self.heater_faults = self.printer.load_object(config, 'heater_faults')
+        self.disabled = self.heater_faults.is_disabled(self.name)
+        self.check_range = self.heater_faults.setup_heater(
+            self, self.sensor, self.min_temp, self.max_temp)
         self.sensor.setup_callback(self.temperature_callback)
         self.pwm_delay = self.sensor.get_report_time_delta()
         # Setup temperature checks
@@ -70,7 +77,8 @@ class Heater:
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
     def set_pwm(self, read_time, value):
-        if self.target_temp <= 0. or read_time > self.verify_mainthread_time:
+        if (self.target_temp <= 0. or read_time > self.verify_mainthread_time
+            or self.fault is not None or self.disabled):
             value = 0.
         if ((read_time < self.next_pwm_time or not self.last_pwm_value)
             and abs(value - self.last_pwm_value) < self.min_pwm_change):
@@ -85,18 +93,66 @@ class Heater:
         #              self.name, value, pwm_time,
         #              self.last_temp, self.last_temp_time, self.target_temp)
     def temperature_callback(self, read_time, temp):
+        fault = None
         with self.lock:
             time_diff = read_time - self.last_temp_time
             self.last_temp = temp
             self.last_temp_time = read_time
+            if self.check_range:
+                fault = self._check_range(temp)
             self.control.temperature_update(read_time, temp, self.target_temp)
             temp_diff = temp - self.smoothed_temp
             adj_time = min(time_diff * self.inv_smooth_time, 1.)
             self.smoothed_temp += temp_diff * adj_time
             self.can_extrude = (self.smoothed_temp >= self.min_extrude_temp)
+        if fault is not None:
+            self.heater_faults.notify_fault(self, fault)
         #logging.debug("temp: %.3f %f = %f", read_time, temp)
+    def _check_range(self, temp):
+        # Host side range check (called with self.lock held)
+        if (self.disabled or self.fault is not None
+            or (temp >= self.min_temp and temp <= self.max_temp)):
+            self.range_errors = 0
+            return None
+        self.range_errors += 1
+        if self.range_errors < RANGE_CHECK_COUNT:
+            return None
+        self.range_errors = 0
+        self.fault = "temperature %.1f not in range %.1f:%.1f" % (
+            temp, self.min_temp, self.max_temp)
+        self.target_temp = 0.
+        return self.fault
     def _handle_shutdown(self):
         self.verify_mainthread_time = -999.
+    # Fault handling
+    def set_fault(self, reason):
+        # Switch off and lock the heater - returns False if already faulted
+        with self.lock:
+            if self.fault is not None or self.disabled:
+                return False
+            self.fault = reason
+            self.target_temp = 0.
+        return True
+    def get_fault(self):
+        return self.fault
+    def clear_fault(self):
+        if self.check_range and (self.last_temp < self.min_temp
+                                 or self.last_temp > self.max_temp):
+            raise self.printer.command_error(
+                "Heater %s temperature %.1f still not in range %.1f:%.1f"
+                % (self.short_name, self.last_temp, self.min_temp,
+                   self.max_temp))
+        with self.lock:
+            self.fault = None
+            self.range_errors = 0
+    def is_disabled(self):
+        return self.disabled
+    def set_disabled(self, disabled):
+        with self.lock:
+            self.disabled = disabled
+            self.fault = None
+            self.range_errors = 0
+            self.target_temp = 0.
     # External commands
     def get_name(self):
         return self.name
@@ -111,6 +167,14 @@ class Heater:
             raise self.printer.command_error(
                 "Requested temperature (%.1f) out of range (%.1f:%.1f)"
                 % (degrees, self.min_temp, self.max_temp))
+        if degrees and self.disabled:
+            raise self.printer.command_error(
+                "Heater %s is disabled (see ENABLE_HEATER)"
+                % (self.short_name,))
+        if degrees and self.fault is not None:
+            raise self.printer.command_error(
+                "Heater %s fault: %s (see RESET_HEATER_FAULT)"
+                % (self.short_name, self.fault))
         with self.lock:
             self.target_temp = degrees
     def get_temp(self, eventtime):
@@ -131,6 +195,8 @@ class Heater:
             self.target_temp = 0.
         return old_control
     def alter_target(self, target_temp):
+        if self.fault is not None or self.disabled:
+            target_temp = 0.
         if target_temp:
             target_temp = max(self.min_temp, min(self.max_temp, target_temp))
         self.target_temp = target_temp
@@ -150,8 +216,12 @@ class Heater:
             target_temp = self.target_temp
             smoothed_temp = self.smoothed_temp
             last_pwm_value = self.last_pwm_value
-        return {'temperature': round(smoothed_temp, 2), 'target': target_temp,
-                'power': last_pwm_value}
+        status = {'temperature': round(smoothed_temp, 2),
+                  'target': target_temp, 'power': last_pwm_value}
+        if self.heater_faults.is_enabled():
+            status['fault'] = self.fault
+            status['disabled'] = self.disabled
+        return status
     cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
     def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
@@ -354,6 +424,9 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+            if heater.get_fault() is not None or heater.is_disabled():
+                # Don't abort a print - fault_gcode decides what to do
+                return
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
@@ -381,6 +454,9 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
+            if isinstance(sensor, Heater) and (
+                    sensor.get_fault() is not None or sensor.is_disabled()):
+                return
             temp, target = sensor.get_temp(eventtime)
             if temp >= min_temp and temp <= max_temp:
                 return

@@ -67,7 +67,7 @@ class HeaterCheck:
                 self.goal_systime = eventtime + self.check_gain_time
             elif self.error >= self.max_error:
                 # Failure due to inability to maintain target temperature
-                return self.heater_fault()
+                return self.heater_fault(eventtime)
         elif temp >= self.goal_temp:
             # Temperature approaching target - reset checks
             self.starting_approach = False
@@ -83,9 +83,18 @@ class HeaterCheck:
             self.goal_temp = min(self.goal_temp, temp + self.heating_gain)
         self.last_target = target
         return eventtime + 1.
-    def heater_fault(self):
+    def heater_fault(self, eventtime):
         msg = "Heater %s not heating at expected rate" % (self.heater_name,)
         logging.error(msg)
+        heater_faults = self.printer.lookup_object('heater_faults', None)
+        if heater_faults is not None and heater_faults.is_enabled():
+            # Non-fatal fault - the heater is switched off and the checks
+            # restart with the next target temperature
+            heater_faults.heater_fault(self.heater, "not heating at"
+                                       " expected rate")
+            self.approaching_target = self.starting_approach = False
+            self.last_target = self.error = 0.
+            return eventtime + 1.
         self.printer.invoke_shutdown(msg + HINT_THERMAL)
         return self.printer.get_reactor().NEVER
 

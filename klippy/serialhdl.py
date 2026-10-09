@@ -116,7 +116,8 @@ class SerialReader:
             self.ffi_lib.serialqueue_set_receive_window(
                 self.serialqueue, receive_window)
         return True
-    def connect_canbus(self, canbus_uuid, canbus_nodeid, canbus_iface="can0"):
+    def connect_canbus(self, canbus_uuid, canbus_nodeid, canbus_iface="can0",
+                       timeout=90.):
         import can # XXX
         txid = canbus_nodeid * 2 + 256
         filters = [{"can_id": txid+1, "can_mask": 0x7ff, "extended": False}]
@@ -137,7 +138,7 @@ class SerialReader:
         logging.info("%sStarting CAN connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
         while 1:
-            if self.reactor.monotonic() > start_time + 90.:
+            if self.reactor.monotonic() > start_time + timeout:
                 self._error("Unable to connect")
             try:
                 bus = can.interface.Bus(channel=canbus_iface,
@@ -165,11 +166,11 @@ class SerialReader:
             logging.info("%sFailed to match canbus_uuid - retrying..",
                          self.warn_prefix)
             self.disconnect()
-    def connect_pipe(self, filename):
+    def connect_pipe(self, filename, timeout=90.):
         logging.info("%sStarting connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
         while 1:
-            if self.reactor.monotonic() > start_time + 90.:
+            if self.reactor.monotonic() > start_time + timeout:
                 self._error("Unable to connect")
             try:
                 fd = os.open(filename, os.O_RDWR | os.O_NOCTTY)
@@ -182,12 +183,12 @@ class SerialReader:
             ret = self._start_session(serial_dev)
             if ret:
                 break
-    def connect_uart(self, serialport, baud, rts=True):
+    def connect_uart(self, serialport, baud, rts=True, timeout=90.):
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
         while 1:
-            if self.reactor.monotonic() > start_time + 90.:
+            if self.reactor.monotonic() > start_time + timeout:
                 self._error("Unable to connect")
             try:
                 serial_dev = serial.Serial(baudrate=baud, timeout=0,
@@ -206,11 +207,21 @@ class SerialReader:
                 break
     def connect_file(self, debugoutput, dictionary, pace=False):
         self.serial_dev = debugoutput
-        self.msgparser.process_identify(dictionary, decompress=False)
+        if dictionary is not None:
+            self.msgparser.process_identify(dictionary, decompress=False)
         self.serialqueue = self.ffi_main.gc(
             self.ffi_lib.serialqueue_alloc(self.serial_dev.fileno(), b'f', 0,
                                            self.sq_name),
             self.ffi_lib.serialqueue_free)
+    def connect_null(self, dictionary=None):
+        # Discard all messages (disconnected non-critical mcu)
+        if dictionary is not None:
+            msgparser = msgproto.MessageParser(warn_prefix=self.warn_prefix)
+            msgparser.process_identify(dictionary, decompress=False)
+            self.msgparser = msgparser
+        self.connect_file(open(os.devnull, 'wb'), None)
+    def set_msgparser(self, msgparser):
+        self.msgparser = msgparser
     def set_clock_est(self, freq, conv_time, conv_clock, last_clock):
         self.ffi_lib.serialqueue_set_clock_est(
             self.serialqueue, freq, conv_time, conv_clock, last_clock)
@@ -249,9 +260,14 @@ class SerialReader:
                 self.handlers[name, oid] = callback
     # Command sending
     def raw_send(self, cmd, minclock, reqclock, cmd_queue):
+        if self.serialqueue is None:
+            # Not connected (reconnect of a non-critical mcu in progress)
+            return
         self.ffi_lib.serialqueue_send(self.serialqueue, cmd_queue,
                                       cmd, len(cmd), minclock, reqclock, 0)
     def raw_send_wait_ack(self, cmd, minclock, reqclock, cmd_queue):
+        if self.serialqueue is None:
+            self._error("Serial connection closed")
         self.last_notify_id += 1
         nid = self.last_notify_id
         completion = self.reactor.completion()

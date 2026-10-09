@@ -65,6 +65,7 @@ defs_steppersync = """
         , struct serialqueue *sq, int move_num);
     void steppersync_set_time(struct steppersync *ss
         , double time_offset, double mcu_freq);
+    void steppersync_discard(struct steppersync *ss);
     struct steppersyncmgr *steppersyncmgr_alloc(void);
     void steppersyncmgr_free(struct steppersyncmgr *ssm);
     struct steppersync *steppersyncmgr_alloc_steppersync(

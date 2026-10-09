@@ -93,6 +93,15 @@ class PrinterMotionQueuing:
         ffi_lib.steppersync_setup_movequeue(ss, serialqueue, move_count)
         mcu_freq = float(mcu.seconds_to_clock(1.))
         ffi_lib.steppersync_set_time(ss, 0., mcu_freq)
+    def reset_mcu_clock(self, mcu):
+        # The clock of an mcu was restarted (non-critical mcu disconnect or
+        # reconnect) - discard its pending steps and resync its clock
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ss = self._lookup_steppersync(mcu)
+        offset, freq = mcu.calibrate_clock(self.last_step_gen_time,
+                                           self.reactor.monotonic())
+        ffi_lib.steppersync_set_time(ss, offset, freq)
+        ffi_lib.steppersync_discard(ss)
     def stats(self, eventtime):
         # Globally calibrate mcu clocks (and step generation clocks)
         sync_time = self.last_step_gen_time

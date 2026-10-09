@@ -193,6 +193,7 @@ class MCU_I2C:
         self._to_write = []
         # Host side I2C error handling
         self._configured = False
+        self._raise_errors = False
     def _handle_connect(self):
         for data in self._to_write:
             self.i2c_write(data)
@@ -204,6 +205,10 @@ class MCU_I2C:
         return self.i2c_address
     def get_command_queue(self):
         return self.cmd_queue
+    def set_raise_errors(self, raise_errors=True):
+        # Report I2C bus errors as mcu.error exceptions instead of
+        # shutting down the printer (for purely informative sensors)
+        self._raise_errors = raise_errors
     def _async_write_status(self, params):
         status = params["i2c_bus_status"]
         if status == "SUCCESS":
@@ -297,6 +302,8 @@ class MCU_I2C:
             return param
         err_msg = "MCU '%s' I2C request to addr %i reports error %s" % (
             self.mcu.get_name(), self.i2c_address, status)
+        if self._raise_errors:
+            raise mcu.error(err_msg)
         self.mcu.get_printer().invoke_shutdown(err_msg)
 
 def MCU_I2C_from_config(config, default_addr=None, default_speed=100000,

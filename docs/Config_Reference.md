@@ -72,6 +72,35 @@ pins such as "extra_mcu:ar9" may then be used elsewhere in the config
 ```
 [mcu my_extra_mcu]
 # See the "mcu" section for configuration parameters.
+#is_non_critical: False
+#   If set to True the printer can start and keep running without
+#   this micro-controller (for example an optional filament station).
+#   When it is missing at startup a warning is reported and all
+#   commands for it are discarded. When the connection is lost (or the
+#   micro-controller shuts down) during operation the printer is not
+#   shut down; an error is reported and disconnect_gcode is run. Use
+#   MCU_RECONNECT to bring it back online. To start without the
+#   micro-controller it has to be connected at least once (its data
+#   dictionary is cached, see dictionary_cache). Do not use this for
+#   micro-controllers that control the motion system or heaters that
+#   must be supervised. The default is False.
+#connect_timeout: 10
+#   Time (in seconds) to wait for a non-critical micro-controller at
+#   startup before continuing without it. The default is 10 seconds.
+#reconnect_interval: 0
+#   If set, a disconnected non-critical micro-controller is reconnected
+#   automatically. A connection attempt is made every given number of
+#   seconds while the printer is not printing. The default is 0 (only
+#   reconnect with MCU_RECONNECT).
+#disconnect_gcode:
+#   A list of G-Code commands to execute when a non-critical
+#   micro-controller is lost during operation. The parameters MCU and
+#   REASON are available. The default pauses a running print
+#   (requires [pause_resume]).
+#dictionary_cache:
+#   File used to store the data dictionary of a non-critical
+#   micro-controller. The default is ".mcu_<name>.dict" in the
+#   directory of the printer config file.
 ```
 
 ## Common kinematic settings
@@ -2698,6 +2727,48 @@ printer. Use verify_heater sections to change the default settings.
 #   value. The default is 2.
 ```
 
+### [heater_faults]
+
+Non-fatal heater faults (similar to the heater fault handling of
+RepRapFirmware). Without this section every heater error shuts down
+the printer. With it, a heater whose temperature leaves the
+min_temp/max_temp range or which is "not heating at expected rate" is
+switched off and locked, an error is reported and fault_gcode is run
+(by default a running print is paused). After fixing the problem the
+fault is cleared with `RESET_HEATER_FAULT` and the print can be
+resumed. Faults are not stored: a fault that is still present after a
+restart is detected again and has to be cleared again. The range of
+temperature_sensor sections is also checked by the host: an error is
+reported instead of shutting down the printer. Heaters and
+temperature_sensor sections can be disabled until the next restart
+with `DISABLE_HEATER` (for example a defective tool head of an IDEX
+printer). See the [G-Codes](G-Codes.md#heater_faults) document for the
+commands.
+
+Note that the range check is done by the host - the micro-controller
+only enforces the optional hard_max_temp_margin of heaters. The
+micro-controller still switches off a heater if the host stops
+updating it. Sensors that check their range themselves (for example
+thermocouple amplifiers reporting a fault) may still shut down the
+printer.
+
+```
+[heater_faults]
+#fault_gcode:
+#   A list of G-Code commands to execute when a heater faults. The
+#   parameters HEATER (heater name) and REASON are available. The
+#   commands run after the current command has finished. Faults found
+#   during startup run fault_gcode once the printer is ready. The
+#   default pauses a running print (requires [pause_resume]).
+#hard_max_temp_margin: 0
+#   If set to a value above 0, the micro-controller shuts down the
+#   printer when a heater exceeds its max_temp by more than this value
+#   (in Celsius). Note that a disconnected PT100/PT1000 sensor reads an
+#   extremely high temperature and would then also shut down the
+#   printer. The default is 0 (no hard limit, all range errors are
+#   non-fatal).
+```
+
 ### [homing_heaters]
 
 Tool to disable heaters when homing or probing an axis.
@@ -3001,6 +3072,13 @@ pressure (hPa), relative humidity and in case of the BME680 gas level.
 See [sample-macros.cfg](../config/sample-macros.cfg) for a gcode_macro
 that may be used to report pressure and humidity in addition to
 temperature.
+
+A communication error (for example "I2C START NACK") does not shut
+down the printer. An error is reported, the sensor reports a value of
+9999 and the sensor is re-initialized every 5 seconds until it answers
+again. This requires micro-controller code that reports I2C errors to
+the host (older micro-controller code shuts down on I2C errors and has
+to be updated).
 
 ```
 sensor_type: BME280

@@ -822,6 +822,33 @@ above the supplied MINIMUM and/or at or below the supplied MAXIMUM.
 [TARGET=<target_temperature>]`: Sets the target temperature for a
 heater. If a target temperature is not supplied, the target is 0.
 
+### [heater_faults]
+
+The following commands are available when a
+[heater_faults config section](Config_Reference.md#heater_faults) is
+enabled.
+
+#### RESET_HEATER_FAULT
+`RESET_HEATER_FAULT [HEATER=<heater_name>]`: Clear the fault of the
+given heater (or of all heaters). The command fails if the temperature
+is still outside of the min_temp/max_temp range. The heater stays off
+until a new target temperature is set.
+
+#### DISABLE_HEATER
+`DISABLE_HEATER HEATER=<heater_name>` or `DISABLE_HEATER
+SENSOR=<config_name>`: Disable a heater (for example `extruder1`) or a
+temperature sensor (for example `"temperature_sensor chamber"`). A
+disabled heater can not be turned on and its temperature is not
+checked. The setting is not stored, it is reset by a restart.
+
+#### ENABLE_HEATER
+`ENABLE_HEATER HEATER=<heater_name>` or `ENABLE_HEATER
+SENSOR=<config_name>`: Enable a heater or temperature sensor that was
+disabled with `DISABLE_HEATER`.
+
+#### QUERY_HEATER_FAULTS
+`QUERY_HEATER_FAULTS`: Report all heater faults and disabled heaters.
+
 ### [idle_timeout]
 
 The idle_timeout module is automatically loaded.
@@ -1047,6 +1074,16 @@ acceleration above the specified limits. The
 `INSTANTANEOUS_CORNER_VELOCITY` specifies the maximum instantaneous
 velocity change (in mm/s) of the motor during the junction of two
 moves (the default is 1mm/s).
+
+### [mcu]
+
+#### MCU_RECONNECT
+`MCU_RECONNECT MCU=<mcu_name>`: Reconnect a disconnected non-critical
+micro-controller (see `is_non_critical` in the
+[mcu config section](Config_Reference.md#mcu-my_extra_mcu)). The
+micro-controller is reset if needed, its configuration is sent again
+and the stepper drivers and LEDs on it are initialized again. Its
+motors are disabled. The command waits for all moves to finish.
 
 ### [mcp4018]
 

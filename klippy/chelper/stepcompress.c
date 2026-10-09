@@ -567,6 +567,17 @@ stepcompress_reset(struct stepcompress *sc, uint64_t last_step_clock)
     return 0;
 }
 
+// Discard all pending steps (the clock of the mcu was restarted)
+void
+stepcompress_discard(struct stepcompress *sc)
+{
+    sc->queue_pos = sc->queue_next = sc->queue;
+    sc->next_step_clock = 0;
+    sc->last_step_clock = 0;
+    sc->sdir = -1;
+    calc_last_step_print_time(sc);
+}
+
 // Set last_position in the stepcompress object
 int __visible
 stepcompress_set_last_position(struct stepcompress *sc, uint64_t clock

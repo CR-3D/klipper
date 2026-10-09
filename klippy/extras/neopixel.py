@@ -46,6 +46,8 @@ class PrinterNeoPixel:
         self.old_color_data = bytearray([d ^ 1 for d in self.color_data])
         # Register callbacks
         printer.register_event_handler("klippy:connect", self.send_data)
+        printer.register_event_handler("mcu:reconnected",
+                                       self._handle_mcu_reconnected)
     def build_config(self):
         bmt = self.mcu.seconds_to_clock(BIT_MAX_TIME)
         rmt = self.mcu.seconds_to_clock(RESET_MIN_TIME)
@@ -63,6 +65,15 @@ class PrinterNeoPixel:
         color_data = self.color_data
         for cdidx, (lidx, cidx) in self.color_map:
             color_data[cdidx] = int(led_state[lidx][cidx] * 255. + .5)
+    def _handle_mcu_reconnected(self, mcu):
+        # Resend all colors to a reconnected non-critical mcu
+        if mcu is not self.mcu:
+            return
+        self.old_color_data = bytearray([d ^ 1 for d in self.color_data])
+        try:
+            self.send_data()
+        except self.printer.command_error:
+            logging.exception("Neopixel update failed")
     def send_data(self, print_time=None):
         old_data, new_data = self.old_color_data, self.color_data
         if new_data == old_data:
@@ -88,7 +99,7 @@ class PrinterNeoPixel:
         if print_time is not None:
             minclock = self.mcu.print_time_to_clock(print_time)
         scmd = self.neopixel_send_cmd.send
-        if self.printer.get_start_args().get('debugoutput') is not None:
+        if self.mcu.is_fileoutput():
             return
         for i in range(8):
             params = scmd([self.oid], minclock=minclock,
