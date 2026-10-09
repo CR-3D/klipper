@@ -2087,6 +2087,89 @@ main printer config file. Wildcards may also be used (eg,
 [include my_other_config.cfg]
 ```
 
+An include may be made conditional with `if:${expression}`. The file
+is only loaded if the expression evaluates to true. The expression is
+evaluated as Python (without builtins) at the position of the include
+and may reference any section parsed before it as `section.option`.
+Values of "true"/"false" and numbers are converted accordingly. If the
+expression can not be evaluated (eg, a missing section) the include is
+skipped and a warning is logged. The `[constants]` section may be used
+to hold such values; it is not checked for unknown options.
+
+```
+[constants]
+printer_name: t250
+has_probe: true
+
+[include if:${constants.printer_name == 't250'} printer/t250.cfg]
+[include if:${constants.has_probe} probe.cfg]
+```
+
+The include path may contain variable references (see below). They
+are resolved at the position of the include, so the referenced values
+must be defined before it. A reference without a section refers to
+the `[constants]` section. A condition and variables may be combined.
+
+```
+[constants]
+bed_type: ender3
+probe: bltouch
+
+[include beds/${bed_type}.cfg]
+[include if:${constants.has_probe} probes/${probe}.cfg]
+```
+
+Config values may reference other config values with
+`${section.option}`. Without a section (`${option}`) the reference
+refers to an option of the same section, or of the `[constants]`
+section if the same section does not define it. A default may be
+given after a colon (`${section.option:default}`), which is used if
+the referenced option does not exist; without a default, a missing
+option is an error. References are resolved after all files have been
+read, so they always see the final (last defined) value. If a value
+containing a reference resolves to `None`, the option is removed, so
+`${constants.x:None}` makes an option optional (a literal `None`
+without a reference is kept). To keep a literal `${...}` in a value
+(eg, in a gcode_macro), write `\${...}`.
+
+```
+[constants]
+bed_size_x: 250
+run_current: 0.8
+
+[stepper_x]
+position_max: ${constants.bed_size_x}
+position_endstop: ${position_max}
+
+[tmc2209 stepper_x]
+run_current: ${constants.run_current}
+
+[probe]
+# Only set if [constants] defines probe_speed
+speed: ${constants.probe_speed:None}
+```
+
+Config values may also contain arithmetic expressions, which are
+evaluated when the config is loaded. Supported are numbers, `+`, `-`,
+`*`, `/`, parentheses and the functions `min()`, `max()`, `abs()` and
+`round()`. In lists, each comma separated element and each line is
+evaluated on its own. Values that are not a valid expression (eg, pin
+names) are left unchanged. Division by zero is an error.
+
+```
+[constants]
+bed_size: 250
+bed_padding: 10
+
+[stepper_x]
+position_max: ${bed_size} - 5
+
+[bed_mesh]
+mesh_min: ${bed_padding}, ${bed_padding}
+mesh_max: ${bed_size} - ${bed_padding}, ${bed_size} - ${bed_padding}
+zero_reference_position: ${bed_size} / 2, ${bed_size} / 2
+```
+
 ### [duplicate_pin_override]
 
 This tool allows a single micro-controller pin to be defined multiple

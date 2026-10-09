@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, glob, re, time, logging, configparser, io
+import sys, os, glob, re, time, logging, configparser, io, ast
 
 error = configparser.Error
 
@@ -138,6 +138,200 @@ class ConfigWrapper:
 # Config file parsing (with include file support)
 ######################################################################
 
+# Section reserved for user defined values referenced by variables and
+# include conditions. It has no runtime object, so the unused-options
+# check skips it.
+CONSTANTS_SECTION = 'constants'
+
+# Conditional include of the form "[include if:${expression} path.cfg]"
+_CONDITIONAL_INCLUDE_RE = re.compile(r"if:\$\{(.+?)\}\s+(.*)")
+
+# Variable reference of the form "${[section.]option[:default]}". A
+# reference preceded by a backslash ("\${...}") is left as literal text.
+_VARIABLE_RE = re.compile(
+    r"(?<!\\)\$\{"
+    r"(?:(?P<section>[^.:${}]+)\.)?"
+    r"(?P<option>[^${}:]+)"
+    r"(?::(?P<default>[^${}]*))?"
+    r"\}")
+
+# Arithmetic in config values: numbers, + - * /, parentheses and the
+# functions below. Anything else is left untouched.
+_ARITHMETIC_CHARS_RE = re.compile(r"^[\w\s.+\-*/(),]+$")
+_ARITHMETIC_FUNCS = {'min': min, 'max': max, 'abs': abs, 'round': round}
+_ARITHMETIC_BINOPS = {
+    ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+}
+_ARITHMETIC_UNARYOPS = {ast.UAdd: lambda a: +a, ast.USub: lambda a: -a}
+_ARITHMETIC_NUM_NODE = getattr(ast, 'Constant', None) or ast.Num
+
+class _NotArithmetic(Exception):
+    pass
+
+def _eval_arithmetic_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_arithmetic_node(node.body)
+    if isinstance(node, _ARITHMETIC_NUM_NODE):
+        num = getattr(node, 'value', getattr(node, 'n', None))
+        if isinstance(num, (int, float)) and not isinstance(num, bool):
+            return num
+        raise _NotArithmetic()
+    if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC_BINOPS:
+        return _ARITHMETIC_BINOPS[type(node.op)](
+            _eval_arithmetic_node(node.left), _eval_arithmetic_node(node.right))
+    if (isinstance(node, ast.UnaryOp)
+        and type(node.op) in _ARITHMETIC_UNARYOPS):
+        return _ARITHMETIC_UNARYOPS[type(node.op)](
+            _eval_arithmetic_node(node.operand))
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in _ARITHMETIC_FUNCS and not node.keywords):
+        args = [_eval_arithmetic_node(a) for a in node.args]
+        return _ARITHMETIC_FUNCS[node.func.id](*args)
+    raise _NotArithmetic()
+
+def _evaluate_arithmetic_item(value):
+    """Returns the result of value as a string if it is an arithmetic
+    expression (eg, "250 - 2 * 5" or "max(10, 20) / 2"), otherwise value
+    unchanged. Plain numbers are never rewritten."""
+    if not value.strip() or not _ARITHMETIC_CHARS_RE.match(value):
+        return value
+    try:
+        tree = ast.parse(value.strip(), mode='eval')
+    except SyntaxError:
+        return value
+    if not any(isinstance(n, (ast.BinOp, ast.Call)) for n in ast.walk(tree)):
+        return value
+    try:
+        result = _eval_arithmetic_node(tree)
+    except _NotArithmetic:
+        return value
+    except (ArithmeticError, TypeError, ValueError) as e:
+        raise error("Unable to evaluate expression '%s': %s"
+                    % (value.strip(), e))
+    if isinstance(result, float) and result.is_integer():
+        result = int(result)
+    if isinstance(result, float):
+        result = "%.12g" % (result,)
+    # Keep surrounding whitespace so list and multi-line layout is preserved
+    lead = value[:len(value) - len(value.lstrip())]
+    trail = value[len(value.rstrip()):]
+    return lead + str(result) + trail
+
+def _evaluate_arithmetic(value):
+    """Evaluates arithmetic expressions in a config value. Each line and
+    each comma separated list element (outside of parentheses) is
+    evaluated on its own, so "250 - 10, 250 - 10" becomes "240, 240"."""
+    lines = []
+    for line in value.split('\n'):
+        items = []
+        depth = start = 0
+        for i, c in enumerate(line):
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            elif c == ',' and depth == 0:
+                items.append(line[start:i])
+                start = i + 1
+        items.append(line[start:])
+        lines.append(','.join([_evaluate_arithmetic_item(i) for i in items]))
+    return '\n'.join(lines)
+
+class ConfigVariableResolver:
+    """Resolves "${section.option}" references against a fileconfig. A
+    reference without a section refers to an option of the same section,
+    or of the [constants] section if the same section does not have it.
+    If the referenced option does not exist, the default after the colon
+    is used (if given). Afterwards arithmetic expressions are evaluated."""
+    def __init__(self, fileconfig):
+        self.fileconfig = fileconfig
+        self.cache = {}
+        self.in_progress = []
+    def resolve(self, section, option):
+        key = (section, option)
+        if key in self.cache:
+            return self.cache[key]
+        if key in self.in_progress:
+            chain = self.in_progress[self.in_progress.index(key):] + [key]
+            raise error("Circular variable reference: %s" % (
+                " -> ".join(["%s.%s" % k for k in chain]),))
+        self.in_progress.append(key)
+        try:
+            value = self.fileconfig.get(section, option)
+            value = self._substitute(
+                value, section, "Option '%s' in section '%s'"
+                % (option, section))
+            try:
+                value = _evaluate_arithmetic(value)
+            except error as e:
+                raise error("Option '%s' in section '%s': %s"
+                            % (option, section, e))
+        finally:
+            self.in_progress.pop()
+        self.cache[key] = value
+        return value
+    def _substitute(self, value, section, owner):
+        def lookup(m):
+            ref_option = m.group('option').strip()
+            if m.group('section'):
+                candidates = [m.group('section').strip()]
+            else:
+                candidates = [section, CONSTANTS_SECTION]
+            for ref_section in candidates:
+                if (self.fileconfig.has_section(ref_section)
+                    and self.fileconfig.has_option(ref_section, ref_option)):
+                    return self.resolve(
+                        ref_section, self.fileconfig.optionxform(ref_option))
+            if m.group('default') is not None:
+                return m.group('default')
+            raise error("%s references undefined option '%s.%s'"
+                        % (owner, candidates[0], ref_option))
+        return _VARIABLE_RE.sub(lookup, value)
+    def resolve_include_path(self, path):
+        # Bare references in include paths refer to [constants]
+        value = self._substitute(path, CONSTANTS_SECTION,
+                                 "Include '%s'" % (path,))
+        return value.replace('\\${', '${')
+    def resolve_all(self):
+        for section in self.fileconfig.sections():
+            for option in self.fileconfig.options(section):
+                orig = self.fileconfig.get(section, option)
+                value = self.resolve(section, option).replace('\\${', '${')
+                if value.strip() == 'None' and _VARIABLE_RE.search(orig):
+                    # A reference resolving to "None" removes the option,
+                    # so that eg "${constants.x:None}" makes it optional
+                    self.fileconfig.remove_option(section, option)
+                elif value != orig:
+                    self.fileconfig.set(section, option, value)
+
+class ConfigNamespace:
+    """Exposes the options of a config section as attributes so that a
+    conditional include expression like "constants.has_probe" can be
+    evaluated as Python code."""
+    def __init__(self, data):
+        for key, value in data.items():
+            setattr(self, key, value)
+    def __getitem__(self, item):
+        return getattr(self, item)
+    def __repr__(self):
+        return str(self.__dict__)
+
+def _convert_condition_value(value):
+    lvalue = value.lower()
+    if lvalue == "true":
+        return True
+    if lvalue == "false":
+        return False
+    try:
+        if value.isdigit():
+            return int(value)
+        if "." in value:
+            return float(value)
+    except ValueError:
+        pass
+    return value
+
 class ConfigFileReader:
     def read_config_file(self, filename):
         try:
@@ -178,8 +372,38 @@ class ConfigFileReader:
         fileconfig = self._create_fileconfig()
         self.append_fileconfig(fileconfig, data, filename)
         return fileconfig
+    def _check_include_condition(self, expression, fileconfig):
+        resolver = ConfigVariableResolver(fileconfig)
+        def get_value(section, option):
+            try:
+                return resolver.resolve(section, option)
+            except error:
+                return fileconfig.get(section, option)
+        context = {
+            section: ConfigNamespace(
+                {option: _convert_condition_value(get_value(section, option))
+                 for option in fileconfig.options(section)})
+            for section in fileconfig.sections()
+        }
+        try:
+            return eval(expression, {"__builtins__": {}}, context)
+        except Exception as e:
+            logging.warning("Failed to evaluate include condition '%s': %s",
+                            expression, e)
+            return False
     def _resolve_include(self, source_filename, include_spec, fileconfig,
                          visited):
+        include_spec = include_spec.strip()
+        condition_match = _CONDITIONAL_INCLUDE_RE.match(include_spec)
+        if condition_match:
+            expression, include_spec = condition_match.groups()
+            if not self._check_include_condition(expression, fileconfig):
+                logging.info("Include condition '%s' not met, skipping %s",
+                             expression, include_spec)
+                return []
+        if _VARIABLE_RE.search(include_spec):
+            include_spec = ConfigVariableResolver(
+                fileconfig).resolve_include_path(include_spec)
         dirname = os.path.dirname(source_filename)
         include_spec = include_spec.strip()
         include_glob = os.path.join(dirname, include_spec)
@@ -223,6 +447,7 @@ class ConfigFileReader:
     def build_fileconfig_with_includes(self, data, filename):
         fileconfig = self._create_fileconfig()
         self._parse_config(data, filename, fileconfig, set())
+        ConfigVariableResolver(fileconfig).resolve_all()
         return fileconfig
 
 
@@ -431,6 +656,8 @@ class ConfigValidate:
         # Validate that there are no undefined parameters in the config file
         for section_name in fileconfig.sections():
             section = section_name.lower()
+            if section == CONSTANTS_SECTION:
+                continue
             if section not in valid_sections:
                 raise error("Section '%s' is not a valid config section"
                             % (section,))
