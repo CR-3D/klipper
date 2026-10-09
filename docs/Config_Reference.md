@@ -2170,6 +2170,49 @@ mesh_max: ${bed_size} - ${bed_padding}, ${bed_size} - ${bed_padding}
 zero_reference_position: ${bed_size} / 2, ${bed_size} / 2
 ```
 
+### [include_json]
+
+Loads a JSON file as a data section whose values can be used in
+variable references, include paths and include conditions. The file
+is read at the position of the directive and must contain a JSON
+object. Nested objects are flattened to dotted option names (eg,
+`bed.size_x`). Lists are stored as a comma separated list under their
+name and each element as `name.<index>`. JSON `true`/`false` become
+`true`/`false` and `null` becomes `None` (so a reference to it removes
+the option, see above). The section is not checked for unknown
+options. The path is relative to the including file and may contain
+variable references.
+
+```
+[include_json cfg: config.json]
+#   The values of config.json are available as ${cfg.<key>}. If the
+#   name is omitted ([include_json config.json]), the file name
+#   without extension is used as section name.
+```
+
+Example `config.json`:
+```
+{
+  "printer": {"name": "t250"},
+  "bed": {"size_x": 250, "size_y": 250, "padding": 10},
+  "probe": {"enabled": true, "x_offset": -20}
+}
+```
+
+Usage in printer.cfg:
+```
+[include_json cfg: config.json]
+
+[constants]
+bed_x: ${cfg.bed.size_x}
+
+[include printer/${cfg.printer.name}.cfg]
+[include if:${cfg.probe.enabled} probe.cfg]
+
+[bed_mesh]
+mesh_max: ${cfg.bed.size_x} - ${cfg.bed.padding}, ${cfg.bed.size_y} - ${cfg.bed.padding}
+```
+
 ### [duplicate_pin_override]
 
 This tool allows a single micro-controller pin to be defined multiple

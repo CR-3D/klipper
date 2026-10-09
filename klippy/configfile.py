@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, glob, re, time, logging, configparser, io, ast
+import sys, os, glob, re, time, logging, configparser, io, ast, json
 
 error = configparser.Error
 
@@ -140,7 +140,7 @@ class ConfigWrapper:
 
 # Section reserved for user defined values referenced by variables and
 # include conditions. It has no runtime object, so the unused-options
-# check skips it.
+# check skips it (as well as sections loaded with [include_json]).
 CONSTANTS_SECTION = 'constants'
 
 # Conditional include of the form "[include if:${expression} path.cfg]"
@@ -305,6 +305,37 @@ class ConfigVariableResolver:
                 elif value != orig:
                     self.fileconfig.set(section, option, value)
 
+# JSON data include of the form "[include_json [name:] path.json]"
+_JSON_INCLUDE_RE = re.compile(
+    r"^(?:(?P<name>[A-Za-z_]\w*)\s*:\s*)?(?P<path>.+)$")
+
+def _json_value_to_str(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "None"
+    return str(value)
+
+def _flatten_json(data, prefix=""):
+    """Flattens nested JSON objects into "a.b.c" keys. Lists are stored
+    as a comma separated list under their key and each element under
+    "key.<index>"."""
+    items = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            items.extend(_flatten_json(value, prefix + str(key) + "."))
+        return items
+    key = prefix[:-1]
+    if isinstance(data, list):
+        if all(not isinstance(v, (dict, list)) for v in data):
+            items.append((key, ", ".join([_json_value_to_str(v)
+                                          for v in data])))
+        for i, value in enumerate(data):
+            items.extend(_flatten_json(value, "%s.%d." % (key, i)))
+        return items
+    items.append((key, _json_value_to_str(data)))
+    return items
+
 class ConfigNamespace:
     """Exposes the options of a config section as attributes so that a
     conditional include expression like "constants.has_probe" can be
@@ -367,6 +398,8 @@ class ConfigFileReader:
                 strict=False, inline_comment_prefixes=(';', '#'))
         else:
             fileconfig = configparser.RawConfigParser()
+        # Sections that only hold data (no runtime object)
+        fileconfig.data_sections = set([CONSTANTS_SECTION])
         return fileconfig
     def build_fileconfig(self, data, filename):
         fileconfig = self._create_fileconfig()
@@ -379,12 +412,27 @@ class ConfigFileReader:
                 return resolver.resolve(section, option)
             except error:
                 return fileconfig.get(section, option)
-        context = {
-            section: ConfigNamespace(
-                {option: _convert_condition_value(get_value(section, option))
-                 for option in fileconfig.options(section)})
-            for section in fileconfig.sections()
-        }
+        def build_namespace(section):
+            # Dotted options (from JSON) become nested namespaces, so that
+            # "cfg.probe.enabled" works as attribute access
+            tree = {}
+            for option in fileconfig.options(section):
+                value = _convert_condition_value(get_value(section, option))
+                node = tree
+                parts = option.split('.')
+                for part in parts[:-1]:
+                    node = node.setdefault(part, {})
+                    if not isinstance(node, dict):
+                        break
+                else:
+                    node.setdefault(parts[-1], value)
+            def to_namespace(node):
+                return ConfigNamespace(
+                    {k: to_namespace(v) if isinstance(v, dict) else v
+                     for k, v in node.items()})
+            return to_namespace(tree)
+        context = {section: build_namespace(section)
+                   for section in fileconfig.sections()}
         try:
             return eval(expression, {"__builtins__": {}}, context)
         except Exception as e:
@@ -417,6 +465,41 @@ class ConfigFileReader:
             self._parse_config(include_data, include_filename, fileconfig,
                                visited)
         return include_filenames
+    def _resolve_json_include(self, source_filename, include_spec,
+                              fileconfig):
+        mo = _JSON_INCLUDE_RE.match(include_spec.strip())
+        if mo is None:
+            raise error("Invalid include_json '%s'" % (include_spec,))
+        path = mo.group('path').strip()
+        if _VARIABLE_RE.search(path):
+            path = ConfigVariableResolver(fileconfig).resolve_include_path(
+                path)
+        json_filename = os.path.join(os.path.dirname(source_filename), path)
+        name = mo.group('name')
+        if name is None:
+            base = os.path.splitext(os.path.basename(json_filename))[0]
+            name = re.sub(r"\W", "_", base)
+        if (fileconfig.has_section(name)
+            and name.lower() not in fileconfig.data_sections):
+            raise error("include_json section name '%s' conflicts with"
+                        " an existing config section" % (name,))
+        try:
+            with open(json_filename, 'r') as f:
+                data = json.load(f)
+        except (IOError, OSError) as e:
+            raise error("Unable to open JSON file '%s': %s"
+                        % (json_filename, e.strerror or e))
+        except ValueError as e:
+            raise error("Unable to parse JSON file '%s': %s"
+                        % (json_filename, e))
+        if not isinstance(data, dict):
+            raise error("JSON file '%s' must contain an object"
+                        % (json_filename,))
+        if not fileconfig.has_section(name):
+            fileconfig.add_section(name)
+        fileconfig.data_sections.add(name.lower())
+        for option, value in _flatten_json(data):
+            fileconfig.set(name, option, value)
     def _parse_config(self, data, filename, fileconfig, visited):
         path = os.path.abspath(filename)
         if path in visited:
@@ -434,7 +517,11 @@ class ConfigFileReader:
             # Process include or buffer line
             mo = configparser.RawConfigParser.SECTCRE.match(line)
             header = mo and mo.group('header')
-            if header and header.startswith('include '):
+            if header and header.startswith('include_json '):
+                self.append_fileconfig(fileconfig, '\n'.join(buf), filename)
+                del buf[:]
+                self._resolve_json_include(filename, header[13:], fileconfig)
+            elif header and header.startswith('include '):
                 self.append_fileconfig(fileconfig, '\n'.join(buf), filename)
                 del buf[:]
                 include_spec = header[8:].strip()
@@ -656,7 +743,7 @@ class ConfigValidate:
         # Validate that there are no undefined parameters in the config file
         for section_name in fileconfig.sections():
             section = section_name.lower()
-            if section == CONSTANTS_SECTION:
+            if section in getattr(fileconfig, 'data_sections', ()):
                 continue
             if section not in valid_sections:
                 raise error("Section '%s' is not a valid config section"
