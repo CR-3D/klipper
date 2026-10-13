@@ -66,6 +66,34 @@ class PrinterTemperatureMCU:
         self.debug_read_cmd = mcu.lookup_query_command(
             "debug_read order=%c addr=%u", "debug_result val=%u")
         self.mcu_type = mcu.get_constants().get("MCU", "")
+        if mcu.is_offline():
+            # Disconnected non-critical mcu - the calibration can only be
+            # read once it is connected, so there is no mcu range check
+            self.base_temperature, self.slope = 0., 1.
+            self.mcu_adc.setup_adc_sample(REPORT_TIME, SAMPLE_TIME,
+                                          SAMPLE_COUNT)
+            self.printer.register_event_handler("mcu:reconnected",
+                                                self._handle_mcu_reconnected)
+            return
+        self._calibrate()
+        # Setup min/max checks
+        arange = [self.calc_adc(t) for t in [self.min_temp, self.max_temp]]
+        min_adc, max_adc = sorted(arange)
+        self.mcu_adc.setup_adc_sample(REPORT_TIME, SAMPLE_TIME, SAMPLE_COUNT,
+                                      minval=min_adc, maxval=max_adc,
+                                      range_check_count=RANGE_CHECK_COUNT)
+        self.diag_helper.setup_diag_minmax(self.min_temp, self.max_temp,
+                                           min_adc, max_adc)
+    def _handle_mcu_reconnected(self, mcu):
+        if mcu is not self.mcu_adc.get_mcu():
+            return
+        try:
+            self._calibrate()
+        except Exception:
+            logging.exception("mcu_temperature '%s' calibration failed",
+                              mcu.get_name())
+    def _calibrate(self):
+        mcu = self.mcu_adc.get_mcu()
         # Run MCU specific configuration
         cfg_funcs = [
             ('rp2', self.config_rp2040),
@@ -94,14 +122,6 @@ class PrinterTemperatureMCU:
             if self.temp2 is not None:
                 self.slope = (self.temp2 - self.temp1) / (self.adc2 - self.adc1)
             self.base_temperature = self.calc_base(self.temp1, self.adc1)
-        # Setup min/max checks
-        arange = [self.calc_adc(t) for t in [self.min_temp, self.max_temp]]
-        min_adc, max_adc = sorted(arange)
-        self.mcu_adc.setup_adc_sample(REPORT_TIME, SAMPLE_TIME, SAMPLE_COUNT,
-                                      minval=min_adc, maxval=max_adc,
-                                      range_check_count=RANGE_CHECK_COUNT)
-        self.diag_helper.setup_diag_minmax(self.min_temp, self.max_temp,
-                                           min_adc, max_adc)
     def config_unknown(self):
         raise self.printer.config_error("MCU temperature not supported on %s"
                                         % (self.mcu_type,))
