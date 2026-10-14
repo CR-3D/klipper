@@ -363,6 +363,9 @@ class MessageParser:
                 tval = 0
                 if t.is_dynamic_string:
                     tval = ()
+                elif isinstance(t, Enumeration) and t.enums:
+                    # Use a valid enumeration name (preferably value 0)
+                    tval = t.reverse_enums.get(0, sorted(t.enums)[0])
                 argparts[name] = tval
         try:
             msg = mp.encode_by_name(**argparts)

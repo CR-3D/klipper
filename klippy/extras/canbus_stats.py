@@ -54,12 +54,22 @@ class PrinterCANBusStats:
             logging.warning("USB CANBUS bridge '%s' is no longer discarding."
                             % (self.name,))
     def query_event(self, eventtime):
+        if self.mcu.is_fileoutput():
+            # Disconnected non-critical mcu
+            return self.reactor.monotonic() + 1.
         prev_rx = self.status['rx_error']
         prev_tx = self.status['tx_error']
         prev_retries = self.status['tx_retries']
         if prev_rx is None:
             prev_rx = prev_tx = prev_retries = 0
-        params = self.get_canbus_status_cmd.send()
+        try:
+            params = self.get_canbus_status_cmd.send()
+        except self.printer.command_error:
+            if not self.mcu.is_non_critical():
+                raise
+            # Lost connection to a non-critical mcu (it goes offline)
+            logging.info("canbus_stats '%s': query failed", self.name)
+            return self.reactor.monotonic() + 1.
         rx = prev_rx + ((params['rx_error'] - prev_rx) & 0xffffffff)
         tx = prev_tx + ((params['tx_error'] - prev_tx) & 0xffffffff)
         retries = prev_retries + ((params['tx_retries'] - prev_retries)

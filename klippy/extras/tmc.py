@@ -176,7 +176,8 @@ class TMCErrorCheck:
             self.adc_temp = None
             return
     def _do_periodic_check(self, eventtime):
-        if self.mcu_tmc.get_mcu().is_offline():
+        mcu = self.mcu_tmc.get_mcu()
+        if mcu.is_offline():
             # Disconnected non-critical mcu
             return eventtime + 1.
         try:
@@ -186,6 +187,10 @@ class TMCErrorCheck:
             if self.adc_temp_reg is not None:
                 self._query_temperature()
         except self.printer.command_error as e:
+            if mcu.is_non_critical() and "reports error" not in str(e):
+                # Communication lost - the mcu is going offline
+                logging.info("TMC '%s': %s", self.stepper_name, str(e))
+                return eventtime + 1.
             self.printer.invoke_shutdown(str(e))
             return self.printer.get_reactor().NEVER
         return eventtime + 1.
@@ -481,7 +486,9 @@ class TMCCommandHelper:
                     else:
                         self._do_disable(print_time)
             except self.printer.command_error as e:
-                if self.mcu_tmc.get_mcu().is_offline():
+                if (self.mcu_tmc.get_mcu().is_non_critical()
+                    and "reports error" not in str(e)):
+                    # Communication lost - the mcu is going offline
                     logging.info("TMC %s: %s", self.name, str(e))
                     return
                 self.printer.invoke_shutdown(str(e))

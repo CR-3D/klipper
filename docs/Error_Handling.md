@@ -124,3 +124,9 @@ is_non_critical: True
 
 Do not mark a micro-controller as non-critical if it controls the
 motion system or heaters that must be supervised.
+
+## Tests
+
+`scripts/error_handling_sim/run.sh` runs these features against fake
+micro-controllers on a pty (no hardware or cross compiler needed, works
+on Linux and macOS).
