@@ -123,6 +123,40 @@ class TMCErrorCheck:
                 if f in err_fields:
                     err_mask |= self.fields.all_fields[reg_name][f]
         self.drv_status_reg_info = [0, reg_name, mask, err_mask, cs_actual_mask]
+        # Setup for open load (disconnected motor) detection
+        self.stepper = None
+        self.ol_mask = self.stst_mask = 0
+        drv_fields = self.fields.all_fields[reg_name]
+        if all(f in drv_fields for f in ["ola", "olb", "stst"]):
+            self.ol_mask = drv_fields["ola"] | drv_fields["olb"]
+            self.stst_mask = drv_fields["stst"]
+        self.ol_action = config.getchoice('open_load_action',
+                                          OPEN_LOAD_ACTIONS, 'disabled')
+        self.ol_homing_action = config.getchoice(
+            'open_load_homing_action', OPEN_LOAD_HOMING_ACTIONS, 'abort')
+        self.ol_required = config.getint('open_load_count', 3, minval=1)
+        self.ol_max_velocity = config.getfloat('open_load_max_velocity', 0.,
+                                               minval=0.)
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.ol_gcode = gcode_macro.load_template(config, 'open_load_gcode',
+                                                  '')
+        if not self.ol_mask and self.ol_action != 'disabled':
+            raise config.error("Open load detection not supported by '%s'"
+                               % (config.get_name(),))
+        self.ol_count = 0
+        self.ol_fault = False
+        self.homing_move = None
+        self.homing_aborted = False
+        if self.ol_mask:
+            ol_cmd = self.printer.lookup_object('tmc_open_load', None)
+            if ol_cmd is None:
+                ol_cmd = TMCOpenLoadCommand(self.printer)
+                self.printer.add_object('tmc_open_load', ol_cmd)
+            ol_cmd.register_stepper(self.stepper_name, self)
+            self.printer.register_event_handler("homing:homing_move_begin",
+                                                self._handle_homing_move_begin)
+            self.printer.register_event_handler("homing:homing_move_end",
+                                                self._handle_homing_move_end)
         # Setup for temperature query
         self.adc_temp = None
         self.adc_temp_reg = self.fields.lookup_register("adc_temp")
@@ -175,9 +209,124 @@ class TMCErrorCheck:
             # Ignore comms error for temperature
             self.adc_temp = None
             return
+    # Open load (disconnected motor) detection
+    def set_stepper(self, stepper):
+        self.stepper = stepper
+    def _get_ol_action(self):
+        if self.homing_move is not None:
+            return self.ol_homing_action
+        return self.ol_action
+    def _is_above_max_velocity(self):
+        # False open load reports are common at high speeds
+        tmc_freq = self.mcu_tmc.get_tmc_frequency()
+        tstep_reg = self.fields.lookup_register("tstep")
+        if (not self.ol_max_velocity or tmc_freq is None
+            or tstep_reg is None or self.stepper is None):
+            return False
+        min_tstep = TMCtstepHelper(self.mcu_tmc, self.ol_max_velocity,
+                                   pstepper=self.stepper)
+        tstep = self.fields.get_field(
+            "tstep", self.mcu_tmc.get_register(tstep_reg))
+        return tstep < min_tstep
+    def _check_open_load(self):
+        action = self._get_ol_action()
+        val, reg_name = self.drv_status_reg_info[:2]
+        if action == 'disabled' or val & self.stst_mask:
+            # Open load flags are not valid while the motor is at standstill
+            return
+        if not val & self.ol_mask:
+            self.ol_count = 0
+            self.ol_fault = False
+            return
+        if self._is_above_max_velocity():
+            return
+        self.ol_count += 1
+        if self.ol_count < self.ol_required:
+            return
+        fmt = self.fields.pretty_format(reg_name, val)
+        msg = ("TMC '%s' reports open load (motor disconnected?): %s"
+               % (self.stepper_name, fmt))
+        if action == 'abort':
+            self.ol_fault = True
+            if self.homing_aborted:
+                return
+            self.homing_aborted = True
+            if self.homing_move.abort(msg + " - homing aborted"):
+                logging.warning("%s - homing aborted", msg)
+                return
+            action = 'shutdown'
+        if action == 'shutdown':
+            self.ol_fault = True
+            raise self.printer.command_error(msg)
+        if self.ol_fault:
+            # Already reported
+            return
+        self.ol_fault = True
+        logging.warning(msg)
+        self.printer.lookup_object('gcode').respond_raw("!! " + msg)
+        if action == 'gcode':
+            flags = " ".join([f for f in ["ola", "olb"]
+                              if self.fields.get_field(f, val, reg_name)])
+            self.printer.get_reactor().register_callback(
+                (lambda e: self._run_open_load_gcode(flags)))
+    def _run_open_load_gcode(self, flags):
+        context = self.ol_gcode.create_template_context()
+        context['stepper'] = self.stepper_name
+        context['flags'] = flags
+        try:
+            self.printer.lookup_object('gcode').run_script(
+                self.ol_gcode.render(context))
+        except Exception:
+            logging.exception("TMC '%s' open_load_gcode failed",
+                              self.stepper_name)
+    def set_open_load(self, action=None, homing_action=None,
+                      count=None, max_velocity=None):
+        if action is not None:
+            self.ol_action = action
+        if homing_action is not None:
+            self.ol_homing_action = homing_action
+        if count is not None:
+            self.ol_required = count
+        if max_velocity is not None:
+            self.ol_max_velocity = max_velocity
+        self.ol_count = 0
+        self.ol_fault = False
+        if self.check_timer is not None:
+            reactor = self.printer.get_reactor()
+            reactor.update_timer(self.check_timer,
+                                 self._next_check_time(reactor.monotonic()))
+    def get_open_load_status(self):
+        return {'action': self.ol_action,
+                'homing_action': self.ol_homing_action,
+                'count': self.ol_required,
+                'max_velocity': self.ol_max_velocity,
+                'fault': self.ol_fault}
+    def _handle_homing_move_begin(self, hmove):
+        steppers = [s.get_name() for es in hmove.get_mcu_endstops()
+                    for s in es.get_steppers()]
+        if self.stepper_name not in steppers:
+            return
+        self.homing_move = hmove
+        self.homing_aborted = False
+        self.ol_count = 0
+        if self.check_timer is not None:
+            reactor = self.printer.get_reactor()
+            reactor.update_timer(self.check_timer,
+                                 self._next_check_time(reactor.monotonic()))
+    def _handle_homing_move_end(self, hmove):
+        if self.homing_move is hmove:
+            self.homing_move = None
+            self.ol_count = 0
+    def _next_check_time(self, eventtime):
+        if (self.homing_move is not None
+            and self.ol_homing_action != 'disabled'):
+            return eventtime + HOMING_CHECK_INTERVAL
+        return eventtime + 1.
     def _do_periodic_check(self, eventtime):
         try:
             self._query_register(self.drv_status_reg_info)
+            if self.ol_mask:
+                self._check_open_load()
             if self.gstat_reg_info is not None:
                 self._query_register(self.gstat_reg_info)
             if self.adc_temp_reg is not None:
@@ -185,7 +334,7 @@ class TMCErrorCheck:
         except self.printer.command_error as e:
             self.printer.invoke_shutdown(str(e))
             return self.printer.get_reactor().NEVER
-        return eventtime + 1.
+        return self._next_check_time(eventtime)
     def stop_checks(self):
         if self.check_timer is None:
             return
@@ -199,18 +348,23 @@ class TMCErrorCheck:
         if self.gstat_reg_info is not None:
             cleared_flags = self._query_register(self.gstat_reg_info,
                                                  try_clear=self.clear_gstat)
+        self.ol_count = 0
         reactor = self.printer.get_reactor()
         curtime = reactor.monotonic()
-        self.check_timer = reactor.register_timer(self._do_periodic_check,
-                                                  curtime + 1.)
+        self.check_timer = reactor.register_timer(
+            self._do_periodic_check, self._next_check_time(curtime))
         if cleared_flags:
             reset_mask = self.fields.all_fields["GSTAT"]["reset"]
             if cleared_flags & reset_mask:
                 return True
         return False
     def get_status(self, eventtime=None):
+        res = {}
+        if self.ol_mask:
+            res['open_load'] = self.get_open_load_status()
         if self.check_timer is None:
-            return {'drv_status': None, 'temperature': None}
+            res.update({'drv_status': None, 'temperature': None})
+            return res
         temp = None
         if self.adc_temp is not None:
             temp = round((self.adc_temp - 2038) / 7.7, 2)
@@ -219,7 +373,59 @@ class TMCErrorCheck:
             self.last_drv_status = last_value
             fields = self.fields.get_reg_fields(reg_name, last_value)
             self.last_drv_fields = {n: v for n, v in fields.items() if v}
-        return {'drv_status': self.last_drv_fields, 'temperature': temp}
+        res.update({'drv_status': self.last_drv_fields, 'temperature': temp})
+        return res
+
+OPEN_LOAD_ACTIONS = ['disabled', 'warn', 'gcode', 'shutdown']
+OPEN_LOAD_HOMING_ACTIONS = ['disabled', 'abort', 'shutdown']
+HOMING_CHECK_INTERVAL = 0.100
+
+# Runtime control of open load detection for all TMC drivers
+class TMCOpenLoadCommand:
+    def __init__(self, printer):
+        self.echecks = {}
+        gcode = printer.lookup_object('gcode')
+        gcode.register_command("SET_TMC_OPEN_LOAD",
+                               self.cmd_SET_TMC_OPEN_LOAD,
+                               desc=self.cmd_SET_TMC_OPEN_LOAD_help)
+    def register_stepper(self, stepper_name, echeck):
+        self.echecks[stepper_name] = echeck
+    def _get_choice(self, gcmd, name, choices):
+        val = gcmd.get(name, None)
+        if val is None:
+            return None
+        val = val.lower()
+        if val not in choices:
+            raise gcmd.error("Invalid %s '%s' (must be one of: %s)"
+                             % (name, val, ", ".join(choices)))
+        return val
+    cmd_SET_TMC_OPEN_LOAD_help = "Configure TMC open load (motor) detection"
+    def cmd_SET_TMC_OPEN_LOAD(self, gcmd):
+        stepper_name = gcmd.get('STEPPER', None)
+        if stepper_name is None:
+            names = sorted(self.echecks.keys())
+        elif stepper_name in self.echecks:
+            names = [stepper_name]
+        else:
+            raise gcmd.error("Unknown TMC stepper '%s'" % (stepper_name,))
+        action = self._get_choice(gcmd, 'ACTION', OPEN_LOAD_ACTIONS)
+        homing_action = self._get_choice(gcmd, 'HOMING_ACTION',
+                                         OPEN_LOAD_HOMING_ACTIONS)
+        count = gcmd.get_int('COUNT', None, minval=1)
+        max_velocity = gcmd.get_float('MAX_VELOCITY', None, minval=0.)
+        params = [action, homing_action, count, max_velocity]
+        msg = []
+        for name in names:
+            echeck = self.echecks[name]
+            if any(p is not None for p in params):
+                echeck.set_open_load(*params)
+            st = echeck.get_open_load_status()
+            msg.append("%s: action=%s homing_action=%s count=%d"
+                       " max_velocity=%.1f%s"
+                       % (name, st['action'], st['homing_action'],
+                          st['count'], st['max_velocity'],
+                          " FAULT" if st['fault'] else ""))
+        gcmd.respond_info("\n".join(msg))
 
 ######################################################################
 # Record driver status
@@ -483,6 +689,7 @@ class TMCCommandHelper:
         # Lookup stepper object
         force_move = self.printer.lookup_object("force_move")
         self.stepper = force_move.lookup_stepper(self.stepper_name)
+        self.echeck_helper.set_stepper(self.stepper)
         # Note pulse duration and step_both_edge optimizations available
         self.stepper.setup_default_pulse_duration(.000000100, True)
     def _handle_connect(self):

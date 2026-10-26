@@ -3846,6 +3846,41 @@ run_current:
 #   velocity" threshold (THIGH) to. This is typically used to disable
 #   the "CoolStep" feature at high speeds. The default is to not set a
 #   TMC "high velocity" threshold.
+#open_load_action: disabled
+#   What to do when the driver reports an "open load" condition (a
+#   disconnected motor or a broken motor wire) while the motor is
+#   moving. One of "disabled", "warn" (report the error once),
+#   "gcode" (report the error and run open_load_gcode) or "shutdown"
+#   (halt the printer). The open load flags are only evaluated while
+#   the motor is moving, because they are not valid at standstill.
+#   The default is "disabled".
+#open_load_gcode:
+#   A list of G-Code commands to execute when an open load condition
+#   is reported and open_load_action is "gcode" (for example PAUSE, or
+#   a RESPOND command that sends a message to the host software). The
+#   variables "stepper" (the stepper name) and "flags" ("ola", "olb"
+#   or "ola olb") are available in the template. The default is to
+#   not run any commands.
+#open_load_homing_action: abort
+#   What to do when an open load condition is detected during a
+#   homing or probing move that involves this stepper. One of
+#   "disabled", "abort" (stop the homing move on the micro-controller
+#   and fail the homing command with the open load message; falls
+#   back to "shutdown" if the endstop does not support it) or
+#   "shutdown". While such a move is active the driver is queried
+#   every 100ms instead of every second. The default is "abort".
+#open_load_count: 3
+#   The number of consecutive driver status queries that must report
+#   an open load before the action is taken. The default is 3.
+#open_load_max_velocity: 0
+#   Ignore open load reports while the motor is moving faster than
+#   this velocity (in mm/s), as the driver may report false open load
+#   conditions at high speeds. Requires an additional read of the
+#   TSTEP register (not available on the TMC2660). The default is 0
+#   (no limit).
+#   The open_load_action, open_load_homing_action, open_load_count
+#   and open_load_max_velocity parameters may be changed at run-time
+#   with the SET_TMC_OPEN_LOAD command.
 #driver_MSLUT0: 2863314260
 #driver_MSLUT1: 1251300522
 #driver_MSLUT2: 608774441
@@ -3949,6 +3984,12 @@ run_current:
 #   velocity is below this value. Note that the "sensorless homing"
 #   code may temporarily override this setting during homing
 #   operations. The default is 0, which disables "stealthChop" mode.
+#open_load_action: disabled
+#open_load_gcode:
+#open_load_homing_action: abort
+#open_load_count: 3
+#open_load_max_velocity: 0
+#   See the "tmc2130" section for the definition of these parameters.
 #driver_MULTISTEP_FILT: True
 #driver_IHOLDDELAY: 8
 #driver_TPOWERDOWN: 20
@@ -3999,6 +4040,12 @@ run_current:
 #   The address of the TMC2209 chip for UART messages (an integer
 #   between 0 and 3). This is typically used when multiple TMC2209
 #   chips are connected to the same UART pin. The default is zero.
+#open_load_action: disabled
+#open_load_gcode:
+#open_load_homing_action: abort
+#open_load_count: 3
+#open_load_max_velocity: 0
+#   See the "tmc2130" section for the definition of these parameters.
 #driver_MULTISTEP_FILT: True
 #driver_IHOLDDELAY: 8
 #driver_TPOWERDOWN: 20
@@ -4078,6 +4125,12 @@ run_current:
 #   their position. There is also small delay until the current is
 #   raised again, so take this into account when commanding fast moves
 #   while the stepper is idling. The default is 100 (no reduction).
+#open_load_action: disabled
+#open_load_gcode:
+#open_load_homing_action: abort
+#open_load_count: 3
+#open_load_max_velocity: 0
+#   See the "tmc2130" section for the definition of these parameters.
 #driver_TBL: 2
 #driver_RNDTF: 0
 #driver_HDEC: 0
@@ -4167,6 +4220,12 @@ run_current:
 #   velocity" threshold (THIGH) to. This is typically used to disable
 #   the "CoolStep" feature at high speeds. The default is to not set a
 #   TMC "high velocity" threshold.
+#open_load_action: disabled
+#open_load_gcode:
+#open_load_homing_action: abort
+#open_load_count: 3
+#open_load_max_velocity: 0
+#   See the "tmc2130" section for the definition of these parameters.
 #driver_MSLUT0: 2863314260
 #driver_MSLUT1: 1251300522
 #driver_MSLUT2: 608774441
@@ -4303,6 +4362,12 @@ run_current:
 #   velocity" threshold (THIGH) to. This is typically used to disable
 #   the "CoolStep" feature at high speeds. The default is to not set a
 #   TMC "high velocity" threshold.
+#open_load_action: disabled
+#open_load_gcode:
+#open_load_homing_action: abort
+#open_load_count: 3
+#open_load_max_velocity: 0
+#   See the "tmc2130" section for the definition of these parameters.
 #driver_MSLUT0: 2863314260
 #driver_MSLUT1: 1251300522
 #driver_MSLUT2: 608774441

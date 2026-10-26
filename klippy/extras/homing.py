@@ -50,8 +50,25 @@ class HomingMove:
             toolhead = printer.lookup_object('toolhead')
         self.toolhead = toolhead
         self.stepper_positions = []
+        self.abort_message = None
     def get_mcu_endstops(self):
         return [es for es, name in self.endstops]
+    def abort(self, message):
+        # Halt an active homing move and fail it with the given message
+        aborts = []
+        for mcu_endstop, name in self.endstops:
+            abort = getattr(mcu_endstop, 'home_abort', None)
+            if abort is None:
+                # Probe wrappers
+                inner = getattr(mcu_endstop, 'mcu_endstop', None)
+                abort = getattr(inner, 'home_abort', None)
+            if abort is None:
+                return False
+            aborts.append(abort)
+        self.abort_message = message
+        for abort in aborts:
+            abort()
+        return True
     def _calc_endstop_rate(self, mcu_endstop, movepos, speed):
         startpos = self.toolhead.get_position()
         axes_d = [mp - sp for mp, sp in zip(movepos, startpos)]
@@ -77,6 +94,7 @@ class HomingMove:
     def homing_move(self, movepos, speed, probe_pos=False,
                     triggered=True, check_triggered=True):
         # Notify start of homing/probing move
+        self.abort_message = None
         self.printer.send_event("homing:homing_move_begin", self)
         # Note start location
         self.toolhead.flush_step_generation()
@@ -117,6 +135,8 @@ class HomingMove:
                 trigger_times[name] = trigger_time
             elif check_triggered and error is None:
                 error = "No trigger on %s after full movement" % (name,)
+        if self.abort_message is not None:
+            error = self.abort_message
         # Determine stepper halt positions
         self.toolhead.flush_step_generation()
         for sp in self.stepper_positions:

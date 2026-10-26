@@ -1640,6 +1640,19 @@ A VELOCITY can also be specified instead of a VALUE. This velocity is
 converted to the 20bit TSTEP based value representation. Only use the VELOCITY
 argument for fields that represent velocities.
 
+#### SET_TMC_OPEN_LOAD
+`SET_TMC_OPEN_LOAD [STEPPER=<name>] [ACTION=<action>]
+[HOMING_ACTION=<action>] [COUNT=<count>] [MAX_VELOCITY=<velocity>]`:
+Change the open load (disconnected motor) detection of a TMC driver at
+run-time. If STEPPER is omitted, all TMC drivers that support open
+load detection are changed. ACTION may be one of "disabled", "warn",
+"gcode" or "shutdown", HOMING_ACTION one of "disabled", "abort" or
+"shutdown". See the
+[tmc2130 config section](Config_Reference.md#tmc2130) for a
+description of each parameter. Changing a parameter also clears a
+reported fault. Without parameters the current settings are reported.
+Changes are not saved to the config file.
+
 ### [toolhead]
 
 The toolhead module is automatically loaded.

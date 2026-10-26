@@ -264,6 +264,8 @@ class MCU_trsync:
                                           reqclock=clock)
     def set_home_end_time(self, home_end_time):
         self._home_end_clock = self._mcu.print_time_to_clock(home_end_time)
+    def trigger(self, reason):
+        self._trsync_trigger_cmd.send([self._oid, reason])
     def stop(self):
         self._response_trsync.unregister()
         self._response_trsync = None
@@ -328,6 +330,10 @@ class TriggerDispatch:
         if self._mcu.is_fileoutput():
             self._trigger_completion.complete(True)
         self._trigger_completion.wait()
+    def abort(self):
+        # Halt an active homing move (as if the endstop triggered)
+        for trsync in self._trsyncs:
+            trsync.trigger(MCU_trsync.REASON_HOST_REQUEST)
     def stop(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_stop(self._trdispatch)
@@ -398,6 +404,8 @@ class MCU_endstop:
         params = self._query_cmd.send([self._oid])
         next_clock = self._mcu.clock32_to_clock64(params['next_clock'])
         return self._mcu.clock_to_print_time(next_clock - self._rest_ticks)
+    def home_abort(self):
+        self._dispatch.abort()
     def query_endstop(self, print_time):
         clock = self._mcu.print_time_to_clock(print_time)
         if self._mcu.is_fileoutput():

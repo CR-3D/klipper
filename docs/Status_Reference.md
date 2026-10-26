@@ -556,6 +556,11 @@ objects (eg, `[tmc2208 stepper_x]`):
   does not support temperature reporting.
 - `run_current`: The currently set run current.
 - `hold_current`: The currently set hold current.
+- `open_load`: The open load detection settings (`action`,
+  `homing_action`, `count`, `max_velocity`) and `fault`, which is true
+  after an open load condition was reported and until the motor moves
+  again without one (or a SET_TMC_OPEN_LOAD parameter is changed).
+  Only available for drivers that support open load detection.
 
 ## toolhead
 
