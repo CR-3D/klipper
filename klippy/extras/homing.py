@@ -96,6 +96,10 @@ class HomingMove:
         # Notify start of homing/probing move
         self.abort_message = None
         self.printer.send_event("homing:homing_move_begin", self)
+        if self.abort_message is not None:
+            # Aborted before the move started
+            self.printer.send_event("homing:homing_move_end", self)
+            raise self.printer.command_error(self.abort_message)
         # Note start location
         self.toolhead.flush_step_generation()
         kin = self.toolhead.get_kinematics()

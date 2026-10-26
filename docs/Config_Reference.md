@@ -3862,13 +3862,18 @@ run_current:
 #   or "ola olb") are available in the template. The default is to
 #   not run any commands.
 #open_load_homing_action: abort
-#   What to do when an open load condition is detected during a
-#   homing or probing move that involves this stepper. One of
-#   "disabled", "abort" (stop the homing move on the micro-controller
-#   and fail the homing command with the open load message; falls
-#   back to "shutdown" if the endstop does not support it) or
-#   "shutdown". While such a move is active the driver is queried
-#   every 100ms instead of every second. The default is "abort".
+#   What to do when an open load condition is detected during a G28
+#   command (including the moves of homing_override and safe_z_home,
+#   such as z_hop) or during a homing or probing move that involves
+#   this stepper. One of "disabled", "abort" or "shutdown". With
+#   "abort" an active homing move is stopped on the micro-controller
+#   and the homing command fails with the open load message. If the
+#   condition is detected during a regular move of G28 (eg, z_hop),
+#   that move completes, no further homing move is started and G28
+#   fails with the open load message. Falls back to "shutdown" if the
+#   endstop does not support aborting. During G28 and homing moves
+#   the driver is queried every 50ms instead of every second. The
+#   default is "abort".
 #open_load_count: 3
 #   The number of consecutive driver status queries that must report
 #   an open load before the action is taken. The default is 3.

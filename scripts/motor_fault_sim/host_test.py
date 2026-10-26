@@ -50,6 +50,8 @@ class FakeGCode:
         self.raw = []
         self.scripts = []
     def register_command(self, name, func, desc=None):
+        if func is None:
+            return self.commands.pop(name, None)
         self.commands[name] = func
     def respond_raw(self, msg):
         self.raw.append(msg)
@@ -293,10 +295,11 @@ def t_homing_abort():
     es_z1 = FakeEndstop([FakeStepper("stepper_z1")])
     hmove = FakeHomingMove([es_z, es_z1])
     p.send_event("homing:homing_move_begin", hmove)
-    check(abs(ec.check_timer.waketime - p.reactor.now - 0.1) < 1e-9,
+    check(abs(ec.check_timer.waketime - p.reactor.now
+              - tmc.HOMING_CHECK_INTERVAL) < 1e-9,
           "homing: check rescheduled to fast interval")
     res = poll(p, m, ec, drv(f, ola=1), n=2)
-    check(abs(res - p.reactor.now - 0.1) < 1e-9,
+    check(abs(res - p.reactor.now - tmc.HOMING_CHECK_INTERVAL) < 1e-9,
           "homing: fast interval while homing")
     check(es_z.aborts == 0, "homing: debounced")
     poll(p, m, ec, drv(f, ola=1))
@@ -446,6 +449,87 @@ def t_ot_still_errors():
     check(p.shutdown_msg is not None and "ot=1" in p.shutdown_msg,
           "existing over temperature check still active")
 
+def setup_g28(base_g28, opts=None):
+    p, m, ec = setup(opts or {})
+    p.gcode.register_command("G28", base_g28)
+    p.send_event("klippy:connect")
+    ends = []
+    p.register_event_handler("homing:homing_move_end", ends.append)
+    return p, m, ec, ends
+
+def run_g28(p):
+    try:
+        p.gcode.commands["G28"](FakeGCmd({}))
+    except CommandError as e:
+        return str(e)
+    return None
+
+def homing_move_z(p):
+    es = FakeEndstop([FakeStepper("stepper_z")])
+    hmove = homing.HomingMove(p, [(es, "z")], toolhead=object())
+    hmove.homing_move([0., 0., 0., 0.], 5.)
+
+def t_g28_hop():
+    state = {}
+    def base_g28(gcmd):
+        # z_hop: regular move with an open load before the homing move
+        state['in_g28'] = p.lookup_object('tmc_open_load').in_g28
+        state['interval'] = poll(p, m, ec, drv(m.fields, ola=1), n=3)
+        state['interval'] -= p.reactor.now
+        homing_move_z(p)
+        state['homed'] = True
+    p, m, ec, ends = setup_g28(base_g28)
+    err = run_g28(p)
+    check(state.get('in_g28'), "g28: wrapper marks homing context")
+    check(abs(state['interval'] - tmc.HOMING_CHECK_INTERVAL) < 1e-9,
+          "g28: fast polling during z_hop")
+    check(err is not None and "stepper_z" in err
+          and "homing aborted" in err, "g28: fails with open load message")
+    check('homed' not in state, "g28: homing move not started after hop fault")
+    check(len(ends) == 1, "g28: homing_move_end sent for skipped move")
+    check(not errors(p) and p.shutdown_msg is None,
+          "g28: no shutdown, single error")
+    tm = p.lookup_object('tmc_open_load')
+    check(not tm.in_g28 and tm.homing_fault is None, "g28: context cleared")
+    res = poll(p, m, ec, drv(m.fields))
+    check(abs(res - p.reactor.now - 1.) < 1e-9, "g28: back to 1s interval")
+    try:
+        hm = homing.HomingMove(p, [(FakeEndstop([FakeStepper("stepper_z")]),
+                                    "z")], toolhead=object())
+        hm.homing_move([0., 0., 0., 0.], 5.)
+    except CommandError:
+        check(False, "g28: no stale fault for later homing moves")
+    except AttributeError:
+        check(True, "g28: no stale fault for later homing moves")
+
+def t_g28_hop_only():
+    def base_g28(gcmd):
+        poll(p, m, ec, drv(m.fields, olb=1), n=3)
+    p, m, ec, ends = setup_g28(base_g28)
+    err = run_g28(p)
+    check(err is not None and "OpenLoad_B" in err,
+          "g28: fails at the end if no homing move follows")
+
+def t_g28_ok():
+    def base_g28(gcmd):
+        poll(p, m, ec, drv(m.fields), n=3)
+    p, m, ec, ends = setup_g28(base_g28)
+    check(run_g28(p) is None and not errors(p), "g28: no fault, no error")
+
+def t_g28_disabled():
+    def base_g28(gcmd):
+        poll(p, m, ec, drv(m.fields, ola=1), n=5)
+    p, m, ec, ends = setup_g28(base_g28,
+                               {'open_load_homing_action': 'disabled'})
+    check(run_g28(p) is None and not errors(p),
+          "g28: homing action disabled ignores hop fault")
+
+def t_outside_g28():
+    p, m, ec, ends = setup_g28(lambda gcmd: None)
+    poll(p, m, ec, drv(m.fields, ola=1), n=5)
+    check(not errors(p) and p.shutdown_msg is None,
+          "g28: regular move outside G28 uses open_load_action")
+
 class FakeTrsync:
     def __init__(self):
         self.reasons = []
@@ -467,7 +551,8 @@ def main():
               t_shutdown, t_homing_abort, t_homing_default,
               t_homing_probe_wrapper,
               t_homing_fallback, t_homing_shutdown, t_velocity, t_command,
-              t_config, t_ot_still_errors, t_mcu_abort]:
+              t_config, t_ot_still_errors, t_g28_hop, t_g28_hop_only,
+              t_g28_ok, t_g28_disabled, t_outside_g28, t_mcu_abort]:
         t()
     print("RESULT: %s" % ("FAILED (%d)" % len(FAILS) if FAILS else "OK"))
     sys.exit(1 if FAILS else 0)

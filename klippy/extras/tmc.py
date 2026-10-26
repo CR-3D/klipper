@@ -147,12 +147,13 @@ class TMCErrorCheck:
         self.ol_fault = False
         self.homing_move = None
         self.homing_aborted = False
+        self.ol_cmd = None
         if self.ol_mask:
-            ol_cmd = self.printer.lookup_object('tmc_open_load', None)
-            if ol_cmd is None:
-                ol_cmd = TMCOpenLoadCommand(self.printer)
-                self.printer.add_object('tmc_open_load', ol_cmd)
-            ol_cmd.register_stepper(self.stepper_name, self)
+            self.ol_cmd = self.printer.lookup_object('tmc_open_load', None)
+            if self.ol_cmd is None:
+                self.ol_cmd = TMCOpenLoadCommand(self.printer)
+                self.printer.add_object('tmc_open_load', self.ol_cmd)
+            self.ol_cmd.register_stepper(self.stepper_name, self)
             self.printer.register_event_handler("homing:homing_move_begin",
                                                 self._handle_homing_move_begin)
             self.printer.register_event_handler("homing:homing_move_end",
@@ -212,8 +213,11 @@ class TMCErrorCheck:
     # Open load (disconnected motor) detection
     def set_stepper(self, stepper):
         self.stepper = stepper
+    def _in_homing(self):
+        return self.homing_move is not None or (
+            self.ol_cmd is not None and self.ol_cmd.in_g28)
     def _get_ol_action(self):
-        if self.homing_move is not None:
+        if self._in_homing():
             return self.ol_homing_action
         return self.ol_action
     def _is_above_max_velocity(self):
@@ -251,8 +255,14 @@ class TMCErrorCheck:
             if self.homing_aborted:
                 return
             self.homing_aborted = True
-            if self.homing_move.abort(msg + " - homing aborted"):
-                logging.warning("%s - homing aborted", msg)
+            abort_msg = msg + " - homing aborted"
+            logging.warning(abort_msg)
+            if self.homing_move is None:
+                # Regular move during G28 (eg, z_hop) - fail the next
+                # homing move and the G28 command
+                self.ol_cmd.note_homing_fault(abort_msg)
+                return
+            if self.homing_move.abort(abort_msg):
                 return
             action = 'shutdown'
         if action == 'shutdown':
@@ -291,10 +301,7 @@ class TMCErrorCheck:
             self.ol_max_velocity = max_velocity
         self.ol_count = 0
         self.ol_fault = False
-        if self.check_timer is not None:
-            reactor = self.printer.get_reactor()
-            reactor.update_timer(self.check_timer,
-                                 self._next_check_time(reactor.monotonic()))
+        self._reschedule_check()
     def get_open_load_status(self):
         return {'action': self.ol_action,
                 'homing_action': self.ol_homing_action,
@@ -309,17 +316,22 @@ class TMCErrorCheck:
         self.homing_move = hmove
         self.homing_aborted = False
         self.ol_count = 0
-        if self.check_timer is not None:
-            reactor = self.printer.get_reactor()
-            reactor.update_timer(self.check_timer,
-                                 self._next_check_time(reactor.monotonic()))
+        self._reschedule_check()
     def _handle_homing_move_end(self, hmove):
         if self.homing_move is hmove:
             self.homing_move = None
             self.ol_count = 0
+    def note_g28(self, is_active):
+        self.homing_aborted = False
+        self.ol_count = 0
+        self._reschedule_check()
+    def _reschedule_check(self):
+        if self.check_timer is not None:
+            reactor = self.printer.get_reactor()
+            reactor.update_timer(self.check_timer,
+                                 self._next_check_time(reactor.monotonic()))
     def _next_check_time(self, eventtime):
-        if (self.homing_move is not None
-            and self.ol_homing_action != 'disabled'):
+        if self._in_homing() and self.ol_homing_action != 'disabled':
             return eventtime + HOMING_CHECK_INTERVAL
         return eventtime + 1.
     def _do_periodic_check(self, eventtime):
@@ -378,18 +390,57 @@ class TMCErrorCheck:
 
 OPEN_LOAD_ACTIONS = ['disabled', 'warn', 'gcode', 'shutdown']
 OPEN_LOAD_HOMING_ACTIONS = ['disabled', 'abort', 'shutdown']
-HOMING_CHECK_INTERVAL = 0.100
+HOMING_CHECK_INTERVAL = 0.050
 
 # Runtime control of open load detection for all TMC drivers
 class TMCOpenLoadCommand:
     def __init__(self, printer):
+        self.printer = printer
         self.echecks = {}
+        self.in_g28 = False
+        self.homing_fault = None
+        self.prev_G28 = None
         gcode = printer.lookup_object('gcode')
         gcode.register_command("SET_TMC_OPEN_LOAD",
                                self.cmd_SET_TMC_OPEN_LOAD,
                                desc=self.cmd_SET_TMC_OPEN_LOAD_help)
+        printer.register_event_handler("klippy:connect", self._handle_connect)
+        printer.register_event_handler("homing:homing_move_begin",
+                                       self._handle_homing_move_begin)
     def register_stepper(self, stepper_name, echeck):
         self.echecks[stepper_name] = echeck
+    def _handle_connect(self):
+        # Wrap the outermost G28 (including homing_override and
+        # safe_z_home) so that moves before the homing moves (eg, z_hop)
+        # are monitored with the homing action as well
+        gcode = self.printer.lookup_object('gcode')
+        self.prev_G28 = gcode.register_command("G28", None)
+        if self.prev_G28 is not None:
+            gcode.register_command("G28", self.cmd_G28)
+    def note_homing_fault(self, msg):
+        if self.homing_fault is None:
+            self.homing_fault = msg
+    def _handle_homing_move_begin(self, hmove):
+        if self.homing_fault is not None:
+            hmove.abort_message = self.homing_fault
+    def _set_in_g28(self, is_active):
+        self.in_g28 = is_active
+        for echeck in self.echecks.values():
+            echeck.note_g28(is_active)
+    def cmd_G28(self, gcmd):
+        if self.in_g28:
+            self.prev_G28(gcmd)
+            return
+        self.homing_fault = None
+        self._set_in_g28(True)
+        try:
+            self.prev_G28(gcmd)
+        finally:
+            fault = self.homing_fault
+            self.homing_fault = None
+            self._set_in_g28(False)
+        if fault is not None:
+            raise gcmd.error(fault)
     def _get_choice(self, gcmd, name, choices):
         val = gcmd.get(name, None)
         if val is None:
