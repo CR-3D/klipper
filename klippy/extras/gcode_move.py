@@ -134,6 +134,7 @@ class GCodeMove:
     def cmd_G1(self, gcmd):
         # Move
         params = gcmd.get_command_parameters()
+        prev_position = list(self.last_position)
         try:
             for axis, pos in self.axis_map.items():
                 if axis in params:
@@ -158,7 +159,12 @@ class GCodeMove:
         except ValueError as e:
             raise gcmd.error("Unable to parse move '%s'"
                              % (gcmd.get_commandline(),))
-        self.move_with_transform(self.last_position, self.speed)
+        speed = self.speed
+        if all(lp == pp for i, (lp, pp)
+               in enumerate(zip(self.last_position, prev_position)) if i != 3):
+            # Extrude only moves are not affected by the speed override (M220)
+            speed = self.speed / (self.speed_factor * 60.)
+        self.move_with_transform(self.last_position, speed)
     # G-Code coordinate manipulation
     def cmd_G20(self, gcmd):
         # Set units to inches

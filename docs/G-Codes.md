@@ -15,6 +15,8 @@ Klipper supports the following standard G-Code commands:
 - Use absolute/relative coordinates: `G90`, `G91`
 - Set position: `G92 [X<pos>] [Y<pos>] [Z<pos>] [E<pos>]`
 - Set speed factor override percentage: `M220 S<percent>`
+  - Note: The override is not applied to extrude only moves (moves
+    that do not change the X, Y, or Z position).
 - Set extrude factor override percentage: `M221 S<percent>`
 - Set acceleration: `M204 S<value>` OR `M204 P<value> T<value>`
   - Note: If S is not specified and both P and T are specified, then
