@@ -295,6 +295,7 @@ class ConfigVariableResolver:
         return value.replace('\\${', '${')
     def resolve_all(self):
         for section in self.fileconfig.sections():
+            removed = False
             for option in self.fileconfig.options(section):
                 orig = self.fileconfig.get(section, option)
                 value = self.resolve(section, option).replace('\\${', '${')
@@ -302,8 +303,12 @@ class ConfigVariableResolver:
                     # A reference resolving to "None" removes the option,
                     # so that eg "${constants.x:None}" makes it optional
                     self.fileconfig.remove_option(section, option)
+                    removed = True
                 elif value != orig:
                     self.fileconfig.set(section, option, value)
+            # A section whose options were all removed is dropped as well
+            if not self.fileconfig.options(section) and removed:
+                self.fileconfig.remove_section(section)
 
 # JSON data include of the form "[include_json [name:] path.json]"
 _JSON_INCLUDE_RE = re.compile(

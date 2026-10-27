@@ -2129,8 +2129,9 @@ option is an error. References are resolved after all files have been
 read, so they always see the final (last defined) value. If a value
 containing a reference resolves to `None`, the option is removed, so
 `${constants.x:None}` makes an option optional (a literal `None`
-without a reference is kept). To keep a literal `${...}` in a value
-(eg, in a gcode_macro), write `\${...}`.
+without a reference is kept). If all options of a section are removed
+this way, the section is removed as well. To keep a literal `${...}`
+in a value (eg, in a gcode_macro), write `\${...}`.
 
 ```
 [constants]
